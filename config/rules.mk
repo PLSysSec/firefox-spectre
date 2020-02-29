@@ -572,7 +572,7 @@ lucet_options := \
     --guard-size 4GiB \
     --min-reserved-size 4GiB \
     --max-reserved-size 4GiB \
-    --opt-level 2
+    --opt-level 2 \
     --spectre-mitigations-enable
 
 $(WASM_LIBRARY): $(WASM_LIBRARY).$(WASM_OBJ_SUFFIX)
