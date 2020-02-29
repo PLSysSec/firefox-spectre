@@ -1352,7 +1352,7 @@ class TestEmitterBasic(unittest.TestCase):
                 [mozpath.join(reader.config.topsrcdir, f) for f in files] +
                 ([mozpath.join(
                     reader.config.topsrcdir,
-                    'third_party/rust/rlbox_lucet_sandbox/c_src/lucet_sandbox_wrapper.c')]
+                    '../rlbox_lucet_spectre_sandbox/c_src/lucet_sandbox_wrapper.c')]
                  if suffix == '.c' else []))
             for f in files:
                 self.assertIn(mozpath.join(

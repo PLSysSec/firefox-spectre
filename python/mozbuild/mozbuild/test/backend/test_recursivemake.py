@@ -377,7 +377,7 @@ class TestRecursiveMakeBackend(BackendTester):
             ],
             'WASM_CSRCS': [
                 'WASM_CSRCS += $(srcdir)/bar.c',
-                ('WASM_CSRCS += $(srcdir)/third_party/rust/rlbox_lucet_sandbox/'
+                ('WASM_CSRCS += $(srcdir)/../rlbox_lucet_spectre_sandbox/'
                  'c_src/lucet_sandbox_wrapper.c'),
             ],
             'WASM_CPPSRCS': [
