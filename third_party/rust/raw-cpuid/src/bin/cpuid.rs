@@ -91,8 +91,4 @@ fn main() {
         println!("Extended Function Info");
         println!("{:?}", info);
     });
-    cpuid.get_memory_encryption_info().map(|info| {
-        println!("Memory Encryption Info");
-        println!("{:?}", info);
-    });
 }

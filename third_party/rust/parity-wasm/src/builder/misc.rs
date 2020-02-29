@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use crate::rust::vec::Vec;
 use super::invoke::{Invoke, Identity};
 use crate::elements;
 

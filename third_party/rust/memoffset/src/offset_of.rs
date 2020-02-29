@@ -24,7 +24,7 @@
 #[macro_export]
 #[doc(hidden)]
 macro_rules! _memoffset__let_base_ptr {
-    ($name:ident, $type:tt) => {
+    ($name:ident, $type:path) => {
         // No UB here, and the pointer does not dangle, either.
         // But we have to make sure that `uninit` lives long enough,
         // so it has to be in the same scope as `$name`. That's why
@@ -38,11 +38,10 @@ macro_rules! _memoffset__let_base_ptr {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! _memoffset__let_base_ptr {
-    ($name:ident, $type:tt) => {
-        // No UB right here, but we will later offset into a field
-        // of this pointer, and that is UB when the pointer is dangling.
-        let non_null = $crate::ptr::NonNull::<$type>::dangling();
-        let $name = non_null.as_ptr() as *const $type;
+    ($name:ident, $type:path) => {
+        // No UB right here, but we will later dereference this pointer to
+        // offset into a field, and that is UB when the pointer is dangling.
+        let $name = $crate::mem::align_of::<$type>() as *const $type;
     };
 }
 
@@ -50,7 +49,7 @@ macro_rules! _memoffset__let_base_ptr {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! _memoffset__field_check {
-    ($type:tt, $field:tt) => {
+    ($type:path, $field:tt) => {
         // Make sure the field actually exists. This line ensures that a
         // compile-time error is generated if $field is accessed through a
         // Deref impl.
@@ -79,13 +78,15 @@ macro_rules! _memoffset__field_check {
 /// ```
 #[macro_export(local_inner_macros)]
 macro_rules! offset_of {
-    ($parent:tt, $field:tt) => {{
+    ($parent:path, $field:tt) => {{
         _memoffset__field_check!($parent, $field);
 
         // Get a base pointer.
         _memoffset__let_base_ptr!(base_ptr, $parent);
         // Get the field address. This is UB because we are creating a reference to
         // the uninitialized field.
+        // Crucially, we know that this will not trigger a deref coercion because
+        // of the `field_check!` we did above.
         #[allow(unused_unsafe)] // for when the macro is used in an unsafe block
         let field_ptr = unsafe { &(*base_ptr).$field as *const _ };
         let offset = (field_ptr as usize) - (base_ptr as usize);
@@ -131,5 +132,17 @@ mod tests {
 
         assert_eq!(offset_of!(Tup, 0), 0);
         assert_eq!(offset_of!(Tup, 1), 4);
+    }
+
+    #[test]
+    fn path() {
+        mod sub {
+            #[repr(C)]
+            pub struct Foo {
+                pub x: u32,
+            }
+        }
+
+        assert_eq!(offset_of!(sub::Foo, x), 0);
     }
 }

@@ -1,4 +1,4 @@
-use alloc::{string::String, vec::Vec};
+use crate::rust::{vec::Vec, string::String};
 use crate::io;
 
 use super::{Deserialize, Error, Module, Serialize, VarUint32, VarUint7, Type};

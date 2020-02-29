@@ -1,4 +1,4 @@
-use alloc::{string::String, vec::Vec};
+use crate::rust::{vec::Vec, string::String};
 use crate::io;
 
 use super::{CountedList, CountedListWriter, CountedWriter, Deserialize, Error, Serialize, VarInt32, VarUint32, VarUint7};

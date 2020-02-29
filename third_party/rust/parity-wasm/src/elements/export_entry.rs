@@ -1,4 +1,4 @@
-use alloc::string::String;
+use crate::rust::string::String;
 use super::{Deserialize, Serialize, Error, VarUint7, VarUint32};
 use crate::io;
 

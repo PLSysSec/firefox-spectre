@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use crate::rust::vec::Vec;
 use crate::io;
 use super::{Deserialize, Serialize, Error, VarUint32, CountedList, InitExpr, CountedListWriter};
 

@@ -1,9 +1,7 @@
 //! Elements of the WebAssembly binary format.
 
-use alloc::{string::String, vec::Vec};
+use crate::rust::{fmt, vec::Vec, format, string::String};
 use crate::io;
-
-use core::fmt;
 
 macro_rules! buffered_read {
 	($buffer_size: expr, $length: expr, $reader: expr) => {

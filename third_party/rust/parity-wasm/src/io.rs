@@ -3,8 +3,13 @@
 //! Basically it just a replacement for the std::io that is usable from
 //! the `no_std` environment.
 
+use crate::rust::result;
+
 #[cfg(feature="std")]
-use std::io;
+use crate::rust::io;
+
+#[cfg(not(feature="std"))]
+use crate::rust::vec::Vec;
 
 /// IO specific error.
 #[derive(Debug)]
@@ -19,11 +24,11 @@ pub enum Error {
 	InvalidData,
 
 	#[cfg(feature = "std")]
-	IoError(std::io::Error),
+	IoError(io::Error),
 }
 
 /// IO specific Result.
-pub type Result<T> = core::result::Result<T, Error>;
+pub type Result<T> = result::Result<T, Error>;
 
 pub trait Write {
 	/// Write a buffer of data into this write.
@@ -73,7 +78,7 @@ impl<T: AsRef<[u8]>> Read for Cursor<T> {
 }
 
 #[cfg(not(feature = "std"))]
-impl Write for alloc::vec::Vec<u8> {
+impl Write for Vec<u8> {
 	fn write(&mut self, buf: &[u8]) -> Result<()> {
 		self.extend(buf);
 		Ok(())
