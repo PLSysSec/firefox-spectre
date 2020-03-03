@@ -573,7 +573,11 @@ lucet_options := \
     --min-reserved-size 4GiB \
     --max-reserved-size 4GiB \
     --opt-level 2 \
-    --spectre-mitigations-enable
+    --spectre-mitigations-enable \
+    --pinned-heap-reg \
+    --pinned-control-flow \
+    --spectre-callbacks-workaround
+
 
 $(WASM_LIBRARY): $(WASM_LIBRARY).$(WASM_OBJ_SUFFIX)
 	$(REPORT_BUILD)
