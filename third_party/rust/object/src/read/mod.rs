@@ -1,46 +1,101 @@
 //! Interface for reading object files.
 
-use crate::alloc::vec::Vec;
-use crate::common::{RelocationEncoding, RelocationKind, SectionKind, SymbolKind, SymbolScope};
+use alloc::vec::Vec;
+use core::{cmp, fmt, result};
+
+use crate::common::{
+    FileFlags, RelocationEncoding, RelocationKind, SectionFlags, SectionKind, SymbolFlags,
+    SymbolKind, SymbolScope,
+};
+use crate::pod::Bytes;
+
+mod util;
 
 mod any;
 pub use any::*;
 
-mod coff;
-pub use coff::*;
+#[cfg(feature = "coff")]
+pub mod coff;
 
-mod elf;
-pub use elf::*;
+#[cfg(feature = "elf")]
+pub mod elf;
 
-mod macho;
-pub use macho::*;
+#[cfg(feature = "macho")]
+pub mod macho;
 
-mod pe;
-pub use pe::*;
+#[cfg(feature = "pe")]
+pub mod pe;
 
 mod traits;
 pub use traits::*;
 
 #[cfg(feature = "wasm")]
-mod wasm;
-#[cfg(feature = "wasm")]
-pub use wasm::*;
+pub mod wasm;
 
-/// The native object file for the target platform.
-#[cfg(target_os = "linux")]
-pub type NativeFile<'data> = ElfFile<'data>;
+mod private {
+    pub trait Sealed {}
+}
 
-/// The native object file for the target platform.
-#[cfg(target_os = "macos")]
-pub type NativeFile<'data> = MachOFile<'data>;
+/// The error type used within the read module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Error(&'static str);
 
-/// The native object file for the target platform.
-#[cfg(target_os = "windows")]
-pub type NativeFile<'data> = PeFile<'data>;
+impl fmt::Display for Error {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
 
-/// The native object file for the target platform.
-#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-pub type NativeFile<'data> = WasmFile<'data>;
+#[cfg(feature = "std")]
+impl std::error::Error for Error {}
+
+/// The result type used within the read module.
+pub type Result<T> = result::Result<T, Error>;
+
+trait ReadError<T> {
+    fn read_error(self, error: &'static str) -> Result<T>;
+}
+
+impl<T> ReadError<T> for result::Result<T, ()> {
+    fn read_error(self, error: &'static str) -> Result<T> {
+        self.map_err(|()| Error(error))
+    }
+}
+
+impl<T> ReadError<T> for Option<T> {
+    fn read_error(self, error: &'static str) -> Result<T> {
+        self.ok_or(Error(error))
+    }
+}
+
+/// The native executable file for the target platform.
+#[cfg(all(target_os = "linux", target_pointer_width = "32", feature = "elf"))]
+pub type NativeFile<'data> = elf::ElfFile32<'data>;
+
+/// The native executable file for the target platform.
+#[cfg(all(target_os = "linux", target_pointer_width = "64", feature = "elf"))]
+pub type NativeFile<'data> = elf::ElfFile64<'data>;
+
+/// The native executable file for the target platform.
+#[cfg(all(target_os = "macos", target_pointer_width = "32", feature = "macho"))]
+pub type NativeFile<'data> = macho::MachOFile32<'data>;
+
+/// The native executable file for the target platform.
+#[cfg(all(target_os = "macos", target_pointer_width = "64", feature = "macho"))]
+pub type NativeFile<'data> = macho::MachOFile64<'data>;
+
+/// The native executable file for the target platform.
+#[cfg(all(target_os = "windows", target_pointer_width = "32", feature = "pe"))]
+pub type NativeFile<'data> = pe::PeFile32<'data>;
+
+/// The native executable file for the target platform.
+#[cfg(all(target_os = "windows", target_pointer_width = "64", feature = "pe"))]
+pub type NativeFile<'data> = pe::PeFile64<'data>;
+
+/// The native executable file for the target platform.
+#[cfg(all(feature = "wasm", target_arch = "wasm32", feature = "wasm"))]
+pub type NativeFile<'data> = wasm::WasmFile<'data>;
 
 /// The index used to identify a section of a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -50,17 +105,48 @@ pub struct SectionIndex(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SymbolIndex(pub usize);
 
+/// The section where a symbol is defined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SymbolSection {
+    /// The section is unknown.
+    Unknown,
+    /// The section is not applicable for this symbol (such as file symbols).
+    None,
+    /// The symbol is undefined.
+    Undefined,
+    /// The symbol has an absolute value.
+    Absolute,
+    /// The symbol is a zero-initialized symbol that will be combined with duplicate definitions.
+    Common,
+    /// The symbol is defined in the given section.
+    Section(SectionIndex),
+}
+
+impl SymbolSection {
+    /// Returns the section index for the section where the symbol is defined.
+    ///
+    /// May return `None` if the symbol is not defined in a section.
+    #[inline]
+    pub fn index(self) -> Option<SectionIndex> {
+        if let SymbolSection::Section(index) = self {
+            Some(index)
+        } else {
+            None
+        }
+    }
+}
+
 /// A symbol table entry.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Symbol<'data> {
     name: Option<&'data str>,
     address: u64,
     size: u64,
     kind: SymbolKind,
-    section_index: Option<SectionIndex>,
-    undefined: bool,
+    section: SymbolSection,
     weak: bool,
     scope: SymbolScope,
+    flags: SymbolFlags<SectionIndex>,
 }
 
 impl<'data> Symbol<'data> {
@@ -70,18 +156,32 @@ impl<'data> Symbol<'data> {
         self.kind
     }
 
+    /// Returns the section where the symbol is defined.
+    #[inline]
+    pub fn section(&self) -> SymbolSection {
+        self.section
+    }
+
     /// Returns the section index for the section containing this symbol.
     ///
-    /// May return `None` if the section is unknown or the symbol is undefined.
+    /// May return `None` if the symbol is not defined in a section.
     #[inline]
     pub fn section_index(&self) -> Option<SectionIndex> {
-        self.section_index
+        self.section.index()
     }
 
     /// Return true if the symbol is undefined.
     #[inline]
     pub fn is_undefined(&self) -> bool {
-        self.undefined
+        self.section == SymbolSection::Undefined
+    }
+
+    /// Return true if the symbol is common data.
+    ///
+    /// Note: does not check for `SymbolSection::Section` with `SectionKind::Common`.
+    #[inline]
+    fn is_common(&self) -> bool {
+        self.section == SymbolSection::Common
     }
 
     /// Return true if the symbol is weak.
@@ -108,6 +208,12 @@ impl<'data> Symbol<'data> {
     #[inline]
     pub fn scope(&self) -> SymbolScope {
         self.scope
+    }
+
+    /// Symbol flags that are specific to each file format.
+    #[inline]
+    pub fn flags(&self) -> SymbolFlags<SectionIndex> {
+        self.flags
     }
 
     /// The name of the symbol.
@@ -141,11 +247,11 @@ impl<'data> SymbolMap<'data> {
         self.symbols
             .binary_search_by(|symbol| {
                 if address < symbol.address {
-                    std::cmp::Ordering::Greater
+                    cmp::Ordering::Greater
                 } else if address < symbol.address + symbol.size {
-                    std::cmp::Ordering::Equal
+                    cmp::Ordering::Equal
                 } else {
-                    std::cmp::Ordering::Less
+                    cmp::Ordering::Less
                 }
             })
             .ok()
@@ -153,6 +259,7 @@ impl<'data> SymbolMap<'data> {
     }
 
     /// Get all symbols in the map.
+    #[inline]
     pub fn symbols(&self) -> &[Symbol<'data>] {
         &self.symbols
     }
@@ -165,12 +272,11 @@ impl<'data> SymbolMap<'data> {
             | SymbolKind::Section
             | SymbolKind::File
             | SymbolKind::Label
-            | SymbolKind::Common
             | SymbolKind::Tls => {
                 return false;
             }
         }
-        !symbol.is_undefined() && symbol.size() > 0
+        !symbol.is_undefined() && !symbol.is_common() && symbol.size() > 0
     }
 }
 
@@ -222,29 +328,27 @@ impl Relocation {
     }
 
     /// The addend to use in the relocation calculation.
+    #[inline]
     pub fn addend(&self) -> i64 {
         self.addend
     }
 
     /// Set the addend to use in the relocation calculation.
+    #[inline]
     pub fn set_addend(&mut self, addend: i64) {
         self.addend = addend
     }
 
     /// Returns true if there is an implicit addend stored in the data at the offset
     /// to be relocated.
+    #[inline]
     pub fn has_implicit_addend(&self) -> bool {
         self.implicit_addend
     }
 }
 
-fn data_range(data: &[u8], data_address: u64, range_address: u64, size: u64) -> Option<&[u8]> {
-    if range_address >= data_address {
-        let start_offset = (range_address - data_address) as usize;
-        let end_offset = start_offset + size as usize;
-        if end_offset <= data.len() {
-            return Some(&data[start_offset..end_offset]);
-        }
-    }
-    None
+fn data_range(data: Bytes, data_address: u64, range_address: u64, size: u64) -> Option<&[u8]> {
+    let offset = range_address.checked_sub(data_address)?;
+    let data = data.read_bytes_at(offset as usize, size as usize).ok()?;
+    Some(data.0)
 }

@@ -197,7 +197,7 @@
 //! will require an explicit `.map_err(Error::msg)` when working with a
 //! non-Anyhow error type inside a function that returns Anyhow's error type.
 
-#![doc(html_root_url = "https://docs.rs/anyhow/1.0.30")]
+#![doc(html_root_url = "https://docs.rs/anyhow/1.0.31")]
 #![cfg_attr(backtrace, feature(backtrace))]
 #![cfg_attr(doc_cfg, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -282,6 +282,15 @@ pub use anyhow as format_err;
 /// The Debug format "{:?}" includes your backtrace if one was captured. Note
 /// that this is the representation you get by default if you return an error
 /// from `fn main` instead of printing it explicitly yourself.
+///
+/// ```console
+/// Error: Failed to read instrs from ./path/to/instrs.json
+///
+/// Caused by:
+///     No such file or directory (os error 2)
+/// ```
+///
+/// and if there is a backtrace available:
 ///
 /// ```console
 /// Error: Failed to read instrs from ./path/to/instrs.json

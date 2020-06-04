@@ -1,0 +1,60 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
+
+## [Unreleased]
+
+## [0.3.4] - 2018-08-29
+
+### Fixed
+- Fixed bug where i8 was passed to libc::lstat instead of c_char
+
+## [0.3.3] - 2018-07-01
+
+### Fixed
+- Reverted enum variant `Sc2CVersion` to hardcoded value since it was removed
+  from the `libc` crate.
+
+## [0.3.2] - 2018-05-31
+
+### Added
+- enum variant for `ScNprocessorsConf`
+
+### Changed
+- enum variant `Sc2CVersion` to be derived from libc constant vs hardcoded value
+- hugepages test to be ignored by default as it wasn't reliable on travis.
+
+## [0.3.1] - 2017-09-04
+
+### Fixed
+- Added missing dependencies for Windows
+
+### Added
+- Integration with AppVeyor to catch build problems for Windows
+
+## [0.3.0] - 2017-08-29
+
+### Added
+- A `page` module for querying information related to memory pages.
+
+### Changed
+- Moved the `sysconf` function and related types to their own `raw` module.
+- The `sysconf` function now returns `isize` instead of `c_long`. `c_long`
+  (which is what `libc`'s `sysconf` returns) is always 64 bits on 64-bit
+  platforms, so this is safe - we will never cast the return value of `sysconf`
+  to a smaller type, losing precision.
+- Renamed `SysconfError::Invalid` to `SysconfError::Unsupported` to reflect the
+  fact that the error doesn't indicate that the requested variable can never be
+  valid, but only that it is not supported on the current platform.
+
+## [0.2.0] - 2017-07-22
+
+### Added
+- This CHANGELOG file
+- A couple basic tests
+
+### Changed
+- `sysconf` function now returns c_long instead of i64. This potentially breaks backwards
+  compatability but is necessary to work with 32-bit OS's

@@ -1,44 +1,96 @@
-use crate::alloc::vec::Vec;
-use parity_wasm::elements::{self, Deserialize};
-use std::borrow::Cow;
-use std::{iter, slice};
+//! Support for reading Wasm files.
+//!
+//! Provides `WasmFile` and related types which implement the `Object` trait.
+//!
+//! Currently implements the minimum required to access DWARF debugging information.
+#[cfg(feature = "compression")]
+use alloc::borrow::Cow;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
+use core::{fmt, slice, str};
 use target_lexicon::Architecture;
+use wasmparser as wp;
 
 use crate::read::{
-    Object, ObjectSection, ObjectSegment, Relocation, SectionIndex, SectionKind, Symbol,
-    SymbolIndex, SymbolMap,
+    self, Error, FileFlags, Object, ObjectSection, ObjectSegment, ReadError, Relocation, Result,
+    SectionFlags, SectionIndex, SectionKind, Symbol, SymbolFlags, SymbolIndex, SymbolKind,
+    SymbolMap, SymbolScope, SymbolSection,
 };
 
+const SECTION_CUSTOM: usize = 0;
+const SECTION_TYPE: usize = 1;
+const SECTION_IMPORT: usize = 2;
+const SECTION_FUNCTION: usize = 3;
+const SECTION_TABLE: usize = 4;
+const SECTION_MEMORY: usize = 5;
+const SECTION_GLOBAL: usize = 6;
+const SECTION_EXPORT: usize = 7;
+const SECTION_START: usize = 8;
+const SECTION_ELEMENT: usize = 9;
+const SECTION_CODE: usize = 10;
+const SECTION_DATA: usize = 11;
+const SECTION_DATA_COUNT: usize = 12;
+// Update this constant when adding new section id:
+const MAX_SECTION_ID: usize = SECTION_DATA_COUNT;
+
 /// A WebAssembly object file.
-#[derive(Debug)]
-pub struct WasmFile {
-    module: elements::Module,
+#[derive(Debug, Default)]
+pub struct WasmFile<'data> {
+    // All sections, including custom sections.
+    sections: Vec<wp::Section<'data>>,
+    // Indices into `sections` of sections with a non-zero id.
+    id_sections: Box<[Option<usize>; MAX_SECTION_ID + 1]>,
+    // Payload of custom section called "name".
+    names_data: Option<&'data [u8]>,
+    // Whether the file has DWARF information.
+    has_debug_symbols: bool,
 }
 
-impl<'data> WasmFile {
+impl<'data> WasmFile<'data> {
     /// Parse the raw wasm data.
-    pub fn parse(mut data: &'data [u8]) -> Result<Self, &'static str> {
-        let module =
-            elements::Module::deserialize(&mut data).map_err(|_| "failed to parse wasm")?;
-        Ok(WasmFile { module })
+    pub fn parse(data: &'data [u8]) -> Result<Self> {
+        let module = wp::ModuleReader::new(data)
+            .ok()
+            .read_error("Invalid Wasm header")?;
+
+        let mut file = WasmFile::default();
+
+        for section in module {
+            let section = section.ok().read_error("Invalid Wasm section header")?;
+
+            match section.code {
+                wp::SectionCode::Custom { kind, name } => {
+                    if kind == wp::CustomSectionKind::Name {
+                        file.names_data = Some(section.range().slice(data));
+                    } else if name.starts_with(".debug_") {
+                        file.has_debug_symbols = true;
+                    }
+                }
+                code => {
+                    let id = section_code_to_id(code);
+                    file.id_sections[id] = Some(file.sections.len());
+                }
+            }
+
+            file.sections.push(section);
+        }
+
+        Ok(file)
     }
 }
 
-fn serialize_to_cow<'a, S>(s: S) -> Option<Cow<'a, [u8]>>
-where
-    S: elements::Serialize,
-{
-    let mut buf = Vec::new();
-    s.serialize(&mut buf).ok()?;
-    Some(Cow::from(buf))
-}
+impl<'data> read::private::Sealed for WasmFile<'data> {}
 
-impl<'file> Object<'static, 'file> for WasmFile {
-    type Segment = WasmSegment<'file>;
-    type SegmentIterator = WasmSegmentIterator<'file>;
-    type Section = WasmSection<'file>;
-    type SectionIterator = WasmSectionIterator<'file>;
-    type SymbolIterator = WasmSymbolIterator<'file>;
+impl<'data, 'file> Object<'data, 'file> for WasmFile<'data>
+where
+    'data: 'file,
+{
+    type Segment = WasmSegment<'data, 'file>;
+    type SegmentIterator = WasmSegmentIterator<'data, 'file>;
+    type Section = WasmSection<'data, 'file>;
+    type SectionIterator = WasmSectionIterator<'data, 'file>;
+    type SymbolIterator = WasmSymbolIterator<'data, 'file>;
 
     #[inline]
     fn architecture(&self) -> Architecture {
@@ -59,76 +111,107 @@ impl<'file> Object<'static, 'file> for WasmFile {
         WasmSegmentIterator { file: self }
     }
 
+    #[inline]
     fn entry(&'file self) -> u64 {
-        self.module
-            .start_section()
-            .map_or(u64::max_value(), u64::from)
+        // TODO: Convert start section to an address.
+        0
     }
 
-    fn section_by_name(&'file self, section_name: &str) -> Option<WasmSection<'file>> {
+    fn section_by_name(&'file self, section_name: &str) -> Option<WasmSection<'data, 'file>> {
         self.sections()
-            .find(|section| section.name() == Some(section_name))
+            .find(|section| section.name() == Ok(section_name))
     }
 
-    fn section_by_index(&'file self, index: SectionIndex) -> Option<WasmSection<'file>> {
-        self.sections().find(|section| section.index() == index)
+    fn section_by_index(&'file self, index: SectionIndex) -> Result<WasmSection<'data, 'file>> {
+        // TODO: Missing sections should return an empty section.
+        let id_section = self
+            .id_sections
+            .get(index.0)
+            .and_then(|x| *x)
+            .read_error("Invalid Wasm section index")?;
+        let section = self.sections.get(id_section).unwrap();
+        Ok(WasmSection { section })
     }
 
     fn sections(&'file self) -> Self::SectionIterator {
         WasmSectionIterator {
-            sections: self.module.sections().iter().enumerate(),
+            sections: self.sections.iter(),
         }
     }
 
-    fn symbol_by_index(&self, _index: SymbolIndex) -> Option<Symbol<'static>> {
-        unimplemented!()
+    #[inline]
+    fn symbol_by_index(&self, _index: SymbolIndex) -> Result<Symbol<'data>> {
+        // Wasm doesn't need or support looking up symbols by index.
+        Err(Error("Unsupported Wasm symbol index"))
     }
 
     fn symbols(&'file self) -> Self::SymbolIterator {
-        WasmSymbolIterator { file: self }
+        WasmSymbolIterator {
+            file: self,
+            names: self.names_data.and_then(|names| {
+                let func = wp::NameSectionReader::new(names, 0)
+                    .ok()?
+                    .into_iter()
+                    .filter_map(|name| name.ok())
+                    .find_map(|name| match name {
+                        wp::Name::Function(func) => Some(func),
+                        _ => None,
+                    })?;
+
+                let reader = func.get_map().ok()?;
+
+                Some(NamingIterator { reader }.enumerate())
+            }),
+        }
     }
 
     fn dynamic_symbols(&'file self) -> Self::SymbolIterator {
-        WasmSymbolIterator { file: self }
+        WasmSymbolIterator {
+            file: self,
+            names: None,
+        }
     }
 
-    fn symbol_map(&self) -> SymbolMap<'static> {
+    fn symbol_map(&self) -> SymbolMap<'data> {
         SymbolMap {
             symbols: Vec::new(),
         }
     }
 
     fn has_debug_symbols(&self) -> bool {
-        // We ignore the "name" section, and use this to mean whether the wasm
-        // has DWARF.
-        self.module.sections().iter().any(|s| match *s {
-            elements::Section::Custom(ref c) => c.name().starts_with(".debug_"),
-            _ => false,
-        })
+        self.has_debug_symbols
+    }
+
+    #[inline]
+    fn flags(&self) -> FileFlags {
+        FileFlags::None
     }
 }
 
-/// An iterator over the segments of an `WasmFile`.
+/// An iterator over the segments of a `WasmFile`.
 #[derive(Debug)]
-pub struct WasmSegmentIterator<'file> {
-    file: &'file WasmFile,
+pub struct WasmSegmentIterator<'data, 'file> {
+    file: &'file WasmFile<'data>,
 }
 
-impl<'file> Iterator for WasmSegmentIterator<'file> {
-    type Item = WasmSegment<'file>;
+impl<'data, 'file> Iterator for WasmSegmentIterator<'data, 'file> {
+    type Item = WasmSegment<'data, 'file>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         None
     }
 }
 
-/// A segment of an `WasmFile`.
+/// A segment of a `WasmFile`.
 #[derive(Debug)]
-pub struct WasmSegment<'file> {
-    file: &'file WasmFile,
+pub struct WasmSegment<'data, 'file> {
+    file: &'file WasmFile<'data>,
 }
 
-impl<'file> ObjectSegment<'static> for WasmSegment<'file> {
+impl<'data, 'file> read::private::Sealed for WasmSegment<'data, 'file> {}
+
+impl<'data, 'file> ObjectSegment<'data> for WasmSegment<'data, 'file> {
     #[inline]
     fn address(&self) -> u64 {
         unreachable!()
@@ -149,60 +232,63 @@ impl<'file> ObjectSegment<'static> for WasmSegment<'file> {
         unreachable!()
     }
 
-    fn data(&self) -> &'static [u8] {
+    fn data(&self) -> Result<&'data [u8]> {
         unreachable!()
     }
 
-    fn data_range(&self, _address: u64, _size: u64) -> Option<&'static [u8]> {
+    fn data_range(&self, _address: u64, _size: u64) -> Result<Option<&'data [u8]>> {
         unreachable!()
     }
 
     #[inline]
-    fn name(&self) -> Option<&str> {
+    fn name(&self) -> Result<Option<&str>> {
         unreachable!()
     }
 }
 
-/// An iterator over the sections of an `WasmFile`.
+/// An iterator over the sections of a `WasmFile`.
 #[derive(Debug)]
-pub struct WasmSectionIterator<'file> {
-    sections: iter::Enumerate<slice::Iter<'file, elements::Section>>,
+pub struct WasmSectionIterator<'data, 'file> {
+    sections: slice::Iter<'file, wp::Section<'data>>,
 }
 
-impl<'file> Iterator for WasmSectionIterator<'file> {
-    type Item = WasmSection<'file>;
+impl<'data, 'file> Iterator for WasmSectionIterator<'data, 'file> {
+    type Item = WasmSection<'data, 'file>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.sections.next().map(|(index, section)| WasmSection {
-            index: SectionIndex(index),
-            section,
-        })
+        let section = self.sections.next()?;
+        Some(WasmSection { section })
     }
 }
 
-/// A section of an `WasmFile`.
+/// A section of a `WasmFile`.
 #[derive(Debug)]
-pub struct WasmSection<'file> {
-    index: SectionIndex,
-    section: &'file elements::Section,
+pub struct WasmSection<'data, 'file> {
+    section: &'file wp::Section<'data>,
 }
 
-impl<'file> ObjectSection<'static> for WasmSection<'file> {
-    type RelocationIterator = WasmRelocationIterator;
+impl<'data, 'file> read::private::Sealed for WasmSection<'data, 'file> {}
+
+impl<'data, 'file> ObjectSection<'data> for WasmSection<'data, 'file> {
+    type RelocationIterator = WasmRelocationIterator<'data, 'file>;
 
     #[inline]
     fn index(&self) -> SectionIndex {
-        self.index
+        // Note that we treat all custom sections as index 0.
+        // This is ok because they are never looked up by index.
+        SectionIndex(section_code_to_id(self.section.code))
     }
 
     #[inline]
     fn address(&self) -> u64 {
-        1
+        // TODO: figure out if this should be different for code sections
+        0
     }
 
     #[inline]
     fn size(&self) -> u64 {
-        serialize_to_cow(self.section.clone()).map_or(0, |b| b.len() as u64)
+        let range = self.section.range();
+        (range.end - range.start) as u64
     }
 
     #[inline]
@@ -215,101 +301,142 @@ impl<'file> ObjectSection<'static> for WasmSection<'file> {
         None
     }
 
-    fn data(&self) -> Cow<'static, [u8]> {
-        match *self.section {
-            elements::Section::Custom(ref section) => Some(section.payload().to_vec().into()),
-            elements::Section::Start(section) => {
-                serialize_to_cow(elements::VarUint32::from(section))
-            }
-            _ => serialize_to_cow(self.section.clone()),
-        }
-        .unwrap_or_else(|| Cow::from(&[][..]))
+    #[inline]
+    fn data(&self) -> Result<&'data [u8]> {
+        let mut reader = self.section.get_binary_reader();
+        // TODO: raise a feature request upstream to be able
+        // to get remaining slice from a BinaryReader directly.
+        Ok(reader.read_bytes(reader.bytes_remaining()).unwrap())
     }
 
-    fn data_range(&self, _address: u64, _size: u64) -> Option<&'static [u8]> {
+    fn data_range(&self, _address: u64, _size: u64) -> Result<Option<&'data [u8]>> {
         unimplemented!()
     }
 
+    #[cfg(feature = "compression")]
     #[inline]
-    fn uncompressed_data(&self) -> Cow<'static, [u8]> {
-        // TODO: does wasm support compression?
-        self.data()
-    }
-
-    fn name(&self) -> Option<&str> {
-        match *self.section {
-            elements::Section::Unparsed { .. } => None,
-            elements::Section::Custom(ref c) => Some(c.name()),
-            elements::Section::Type(_) => Some("Type"),
-            elements::Section::Import(_) => Some("Import"),
-            elements::Section::Function(_) => Some("Function"),
-            elements::Section::Table(_) => Some("Table"),
-            elements::Section::Memory(_) => Some("Memory"),
-            elements::Section::Global(_) => Some("Global"),
-            elements::Section::Export(_) => Some("Export"),
-            elements::Section::Start(_) => Some("Start"),
-            elements::Section::Element(_) => Some("Element"),
-            elements::Section::Code(_) => Some("Code"),
-            elements::Section::DataCount(_) => Some("DataCount"),
-            elements::Section::Data(_) => Some("Data"),
-            elements::Section::Name(_) => Some("Name"),
-            elements::Section::Reloc(_) => Some("Reloc"),
-        }
+    fn uncompressed_data(&self) -> Result<Cow<'data, [u8]>> {
+        Ok(Cow::from(self.data()?))
     }
 
     #[inline]
-    fn segment_name(&self) -> Option<&str> {
-        None
+    fn name(&self) -> Result<&str> {
+        Ok(match self.section.code {
+            wp::SectionCode::Custom { name, .. } => name,
+            wp::SectionCode::Type => "<type>",
+            wp::SectionCode::Import => "<import>",
+            wp::SectionCode::Function => "<function>",
+            wp::SectionCode::Table => "<table>",
+            wp::SectionCode::Memory => "<memory>",
+            wp::SectionCode::Global => "<global>",
+            wp::SectionCode::Export => "<export>",
+            wp::SectionCode::Start => "<start>",
+            wp::SectionCode::Element => "<element>",
+            wp::SectionCode::Code => "<code>",
+            wp::SectionCode::Data => "<data>",
+            wp::SectionCode::DataCount => "<data_count>",
+        })
     }
 
+    #[inline]
+    fn segment_name(&self) -> Result<Option<&str>> {
+        Ok(None)
+    }
+
+    #[inline]
     fn kind(&self) -> SectionKind {
-        match *self.section {
-            elements::Section::Unparsed { .. } => SectionKind::Unknown,
-            elements::Section::Custom(_) => SectionKind::Unknown,
-            elements::Section::Type(_) => SectionKind::Other,
-            elements::Section::Import(_) => SectionKind::Other,
-            elements::Section::Function(_) => SectionKind::Other,
-            elements::Section::Table(_) => SectionKind::Other,
-            elements::Section::Memory(_) => SectionKind::Other,
-            elements::Section::Global(_) => SectionKind::Other,
-            elements::Section::Export(_) => SectionKind::Other,
-            elements::Section::Start(_) => SectionKind::Other,
-            elements::Section::Element(_) => SectionKind::Other,
-            elements::Section::Code(_) => SectionKind::Text,
-            elements::Section::DataCount(_) => SectionKind::Other,
-            elements::Section::Data(_) => SectionKind::Data,
-            elements::Section::Name(_) => SectionKind::Other,
-            elements::Section::Reloc(_) => SectionKind::Other,
-        }
+        SectionKind::Unknown
     }
 
-    fn relocations(&self) -> WasmRelocationIterator {
-        WasmRelocationIterator
+    #[inline]
+    fn relocations(&self) -> WasmRelocationIterator<'data, 'file> {
+        WasmRelocationIterator::default()
+    }
+
+    #[inline]
+    fn flags(&self) -> SectionFlags {
+        SectionFlags::None
     }
 }
 
-/// An iterator over the symbols of an `WasmFile`.
-#[derive(Debug)]
-pub struct WasmSymbolIterator<'file> {
-    file: &'file WasmFile,
+// Upstream NamingReader doesn't have Debug derived,
+// so we provide own wrapper that also serves as an Iterator.
+struct NamingIterator<'data> {
+    reader: wp::NamingReader<'data>,
 }
 
-impl<'file> Iterator for WasmSymbolIterator<'file> {
-    type Item = (SymbolIndex, Symbol<'static>);
+impl fmt::Debug for NamingIterator<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NamingIterator")
+            .field("count", &self.reader.get_count())
+            .finish()
+    }
+}
+
+impl<'data> Iterator for NamingIterator<'data> {
+    type Item = wp::Naming<'data>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        unimplemented!()
+        self.reader.read().ok()
     }
 }
 
-/// An iterator over the relocations in an `WasmSection`.
+/// An iterator over the symbols of a `WasmFile`.
 #[derive(Debug)]
-pub struct WasmRelocationIterator;
+pub struct WasmSymbolIterator<'data, 'file> {
+    file: &'file WasmFile<'data>,
+    names: Option<core::iter::Enumerate<NamingIterator<'data>>>,
+}
 
-impl Iterator for WasmRelocationIterator {
+impl<'data, 'file> Iterator for WasmSymbolIterator<'data, 'file> {
+    type Item = (SymbolIndex, Symbol<'data>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (index, naming) = self.names.as_mut()?.next()?;
+        Some((
+            SymbolIndex(index),
+            Symbol {
+                name: Some(naming.name),
+                address: naming.index as u64,
+                size: 0,
+                kind: SymbolKind::Text,
+                // TODO: maybe treat each function as a section?
+                section: SymbolSection::Unknown,
+                weak: false,
+                scope: SymbolScope::Unknown,
+                flags: SymbolFlags::None,
+            },
+        ))
+    }
+}
+
+/// An iterator over the relocations in a `WasmSection`.
+#[derive(Debug, Default)]
+pub struct WasmRelocationIterator<'data, 'file>(PhantomData<(&'data (), &'file ())>);
+
+impl<'data, 'file> Iterator for WasmRelocationIterator<'data, 'file> {
     type Item = (u64, Relocation);
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         None
+    }
+}
+
+fn section_code_to_id(code: wp::SectionCode) -> usize {
+    match code {
+        wp::SectionCode::Custom { .. } => SECTION_CUSTOM,
+        wp::SectionCode::Type => SECTION_TYPE,
+        wp::SectionCode::Import => SECTION_IMPORT,
+        wp::SectionCode::Function => SECTION_FUNCTION,
+        wp::SectionCode::Table => SECTION_TABLE,
+        wp::SectionCode::Memory => SECTION_MEMORY,
+        wp::SectionCode::Global => SECTION_GLOBAL,
+        wp::SectionCode::Export => SECTION_EXPORT,
+        wp::SectionCode::Start => SECTION_START,
+        wp::SectionCode::Element => SECTION_ELEMENT,
+        wp::SectionCode::Code => SECTION_CODE,
+        wp::SectionCode::Data => SECTION_DATA,
+        wp::SectionCode::DataCount => SECTION_DATA_COUNT,
     }
 }

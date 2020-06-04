@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::{env, fs, process};
 
-use object::{write, Object, ObjectSection, RelocationTarget, SectionKind, SymbolKind};
+use object::{
+    write, Object, ObjectSection, RelocationTarget, SectionKind, SymbolFlags, SymbolKind,
+    SymbolSection,
+};
 
 fn main() {
     let mut args = env::args();
@@ -38,6 +41,7 @@ fn main() {
 
     let mut out_object = write::Object::new(in_object.format(), in_object.architecture());
     out_object.mangling = write::Mangling::None;
+    out_object.flags = in_object.flags();
 
     let mut out_sections = HashMap::new();
     for in_section in in_object.sections() {
@@ -45,16 +49,22 @@ fn main() {
             continue;
         }
         let section_id = out_object.add_section(
-            in_section.segment_name().unwrap_or("").as_bytes().to_vec(),
-            in_section.name().unwrap_or("").as_bytes().to_vec(),
+            in_section
+                .segment_name()
+                .unwrap()
+                .unwrap_or("")
+                .as_bytes()
+                .to_vec(),
+            in_section.name().unwrap().as_bytes().to_vec(),
             in_section.kind(),
         );
         let out_section = out_object.section_mut(section_id);
         if out_section.is_bss() {
             out_section.append_bss(in_section.size(), in_section.align());
         } else {
-            out_section.set_data(in_section.uncompressed_data().into(), in_section.align());
+            out_section.set_data(in_section.data().unwrap().into(), in_section.align());
         }
+        out_section.flags = in_section.flags();
         out_sections.insert(in_section.index(), section_id);
     }
 
@@ -63,12 +73,31 @@ fn main() {
         if in_symbol.kind() == SymbolKind::Null {
             continue;
         }
-        let (section, value) = match in_symbol.section_index() {
-            Some(index) => (
-                Some(*out_sections.get(&index).unwrap()),
+        let (section, value) = match in_symbol.section() {
+            SymbolSection::Unknown => panic!("unknown symbol section for {:?}", in_symbol),
+            SymbolSection::None => (write::SymbolSection::None, in_symbol.address()),
+            SymbolSection::Undefined => (write::SymbolSection::Undefined, in_symbol.address()),
+            SymbolSection::Absolute => (write::SymbolSection::Absolute, in_symbol.address()),
+            SymbolSection::Common => (write::SymbolSection::Common, in_symbol.address()),
+            SymbolSection::Section(index) => (
+                write::SymbolSection::Section(*out_sections.get(&index).unwrap()),
                 in_symbol.address() - in_object.section_by_index(index).unwrap().address(),
             ),
-            None => (None, in_symbol.address()),
+        };
+        let flags = match in_symbol.flags() {
+            SymbolFlags::None => SymbolFlags::None,
+            SymbolFlags::Elf { st_info, st_other } => SymbolFlags::Elf { st_info, st_other },
+            SymbolFlags::MachO { n_desc } => SymbolFlags::MachO { n_desc },
+            SymbolFlags::CoffSection {
+                selection,
+                associative_section,
+            } => {
+                let associative_section = *out_sections.get(&associative_section).unwrap();
+                SymbolFlags::CoffSection {
+                    selection,
+                    associative_section,
+                }
+            }
         };
         let out_symbol = write::Symbol {
             name: in_symbol.name().unwrap_or("").as_bytes().to_vec(),
@@ -78,6 +107,7 @@ fn main() {
             scope: in_symbol.scope(),
             weak: in_symbol.is_weak(),
             section,
+            flags,
         };
         let symbol_id = out_object.add_symbol(out_symbol);
         out_symbols.insert(symbol_index, symbol_id);

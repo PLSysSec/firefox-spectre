@@ -2,6 +2,7 @@ use libc;
 use nix::Error;
 use nix::sys::signal::*;
 use nix::unistd::*;
+use std::convert::TryFrom;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[test]
@@ -10,7 +11,15 @@ fn test_kill_none() {
 }
 
 #[test]
+fn test_killpg_none() {
+    killpg(getpgrp(), None)
+        .expect("Should be able to send signal to my process group.");
+}
+
+#[test]
 fn test_old_sigaction_flags() {
+    let _m = ::SIGNAL_MTX.lock().expect("Mutex got poisoned by another test");
+
     extern "C" fn handler(_: ::libc::c_int) {}
     let act = SigAction::new(
         SigHandler::Handler(handler),
@@ -69,7 +78,7 @@ lazy_static! {
 }
 
 extern fn test_sigaction_handler(signal: libc::c_int) {
-    let signal = Signal::from_c_int(signal).unwrap();
+    let signal = Signal::try_from(signal).unwrap();
     SIGNALED.store(signal == Signal::SIGINT, Ordering::Relaxed);
 }
 

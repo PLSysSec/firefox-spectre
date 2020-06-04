@@ -1,17 +1,30 @@
-use {Error, Result, NixPath};
+use {Result, NixPath};
 use errno::Errno;
 use libc::{self, c_int, c_uint, c_char, size_t, ssize_t};
 use sys::stat::Mode;
 use std::os::raw;
 use std::os::unix::io::RawFd;
-use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use std::ptr; // For splice and copy_file_range
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use sys::uio::IoVec;  // For vmsplice
 
+#[cfg(any(target_os = "linux",
+          target_os = "android",
+          target_os = "emscripten",
+          target_os = "fuchsia",
+          any(target_os = "wasi", target_env = "wasi"),
+          target_env = "uclibc",
+          target_env = "freebsd"))]
+pub use self::posix_fadvise::*;
+
 libc_bitflags!{
     pub struct AtFlags: c_int {
+        AT_REMOVEDIR;
+        AT_SYMLINK_FOLLOW;
         AT_SYMLINK_NOFOLLOW;
         #[cfg(any(target_os = "android", target_os = "linux"))]
         AT_NO_AUTOMOUNT;
@@ -105,7 +118,7 @@ libc_bitflags!(
         O_RDONLY;
         /// Allow both reading and writing.
         ///
-        /// This should not be combined with `O_WRONLY` or `O_RDWR`.
+        /// This should not be combined with `O_WRONLY` or `O_RDONLY`.
         O_RDWR;
         /// Similar to `O_DSYNC` but applies to `read`s instead.
         #[cfg(any(target_os = "linux", target_os = "netbsd", target_os = "openbsd"))]
@@ -140,7 +153,8 @@ libc_bitflags!(
 
 pub fn open<P: ?Sized + NixPath>(path: &P, oflag: OFlag, mode: Mode) -> Result<RawFd> {
     let fd = path.with_nix_path(|cstr| {
-        unsafe { libc::open(cstr.as_ptr(), oflag.bits(), mode.bits() as c_uint) }
+        let modebits = c_uint::from(mode.bits());
+        unsafe { libc::open(cstr.as_ptr(), oflag.bits(), modebits) }
     })?;
 
     Errno::result(fd)
@@ -148,39 +162,51 @@ pub fn open<P: ?Sized + NixPath>(path: &P, oflag: OFlag, mode: Mode) -> Result<R
 
 pub fn openat<P: ?Sized + NixPath>(dirfd: RawFd, path: &P, oflag: OFlag, mode: Mode) -> Result<RawFd> {
     let fd = path.with_nix_path(|cstr| {
-        unsafe { libc::openat(dirfd, cstr.as_ptr(), oflag.bits(), mode.bits() as c_uint) }
+        let modebits = c_uint::from(mode.bits());
+        unsafe { libc::openat(dirfd, cstr.as_ptr(), oflag.bits(), modebits) }
     })?;
     Errno::result(fd)
 }
 
-fn wrap_readlink_result(buffer: &mut[u8], res: ssize_t) -> Result<&OsStr> {
+pub fn renameat<P1: ?Sized + NixPath, P2: ?Sized + NixPath>(old_dirfd: Option<RawFd>, old_path: &P1,
+                                                            new_dirfd: Option<RawFd>, new_path: &P2)
+                                                            -> Result<()> {
+    let res = old_path.with_nix_path(|old_cstr| {
+        new_path.with_nix_path(|new_cstr| unsafe {
+            libc::renameat(at_rawfd(old_dirfd), old_cstr.as_ptr(),
+                           at_rawfd(new_dirfd), new_cstr.as_ptr())
+        })
+    })??;
+    Errno::result(res).map(drop)
+}
+
+fn wrap_readlink_result(v: &mut Vec<u8>, res: ssize_t) -> Result<OsString> {
     match Errno::result(res) {
         Err(err) => Err(err),
         Ok(len) => {
-            if (len as usize) >= buffer.len() {
-                Err(Error::Sys(Errno::ENAMETOOLONG))
-            } else {
-                Ok(OsStr::from_bytes(&buffer[..(len as usize)]))
-            }
+            unsafe { v.set_len(len as usize) }
+            Ok(OsString::from_vec(v.to_vec()))
         }
     }
 }
 
-pub fn readlink<'a, P: ?Sized + NixPath>(path: &P, buffer: &'a mut [u8]) -> Result<&'a OsStr> {
+pub fn readlink<P: ?Sized + NixPath>(path: &P) -> Result<OsString> {
+    let mut v = Vec::with_capacity(libc::PATH_MAX as usize);
     let res = path.with_nix_path(|cstr| {
-        unsafe { libc::readlink(cstr.as_ptr(), buffer.as_mut_ptr() as *mut c_char, buffer.len() as size_t) }
+        unsafe { libc::readlink(cstr.as_ptr(), v.as_mut_ptr() as *mut c_char, v.capacity() as size_t) }
     })?;
 
-    wrap_readlink_result(buffer, res)
+    wrap_readlink_result(&mut v, res)
 }
 
 
-pub fn readlinkat<'a, P: ?Sized + NixPath>(dirfd: RawFd, path: &P, buffer: &'a mut [u8]) -> Result<&'a OsStr> {
+pub fn readlinkat<P: ?Sized + NixPath>(dirfd: RawFd, path: &P) -> Result<OsString> {
+    let mut v = Vec::with_capacity(libc::PATH_MAX as usize);
     let res = path.with_nix_path(|cstr| {
-        unsafe { libc::readlinkat(dirfd, cstr.as_ptr(), buffer.as_mut_ptr() as *mut c_char, buffer.len() as size_t) }
+        unsafe { libc::readlinkat(dirfd, cstr.as_ptr(), v.as_mut_ptr() as *mut c_char, v.capacity() as size_t) }
     })?;
 
-    wrap_readlink_result(buffer, res)
+    wrap_readlink_result(&mut v, res)
 }
 
 /// Computes the raw fd consumed by a function of the form `*at`.
@@ -214,7 +240,7 @@ libc_bitflags!(
     }
 );
 
-#[allow(missing_debug_implementations)]
+#[derive(Debug, Eq, Hash, PartialEq)]
 pub enum FcntlArg<'a> {
     F_DUPFD(RawFd),
     F_DUPFD_CLOEXEC(RawFd),
@@ -277,8 +303,7 @@ pub fn fcntl(fd: RawFd, arg: FcntlArg) -> Result<c_int> {
     Errno::result(res)
 }
 
-#[derive(Clone, Copy)]
-#[allow(missing_debug_implementations)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FlockArg {
     LockShared,
     LockExclusive,
@@ -326,15 +351,70 @@ libc_bitflags! {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn splice(fd_in: RawFd, off_in: Option<&mut libc::loff_t>,
-          fd_out: RawFd, off_out: Option<&mut libc::loff_t>,
-          len: usize, flags: SpliceFFlags) -> Result<usize> {
-    use std::ptr;
-    let off_in = off_in.map(|offset| offset as *mut _).unwrap_or(ptr::null_mut());
-    let off_out = off_out.map(|offset| offset as *mut _).unwrap_or(ptr::null_mut());
+/// Copy a range of data from one file to another
+///
+/// The `copy_file_range` system call performs an in-kernel copy between
+/// file descriptors `fd_in` and `fd_out` without the additional cost of
+/// transferring data from the kernel to user space and then back into the
+/// kernel. It copies up to `len` bytes of data from file descriptor `fd_in` to
+/// file descriptor `fd_out`, overwriting any data that exists within the
+/// requested range of the target file.
+///
+/// If the `off_in` and/or `off_out` arguments are used, the values
+/// will be mutated to reflect the new position within the file after
+/// copying. If they are not used, the relevant filedescriptors will be seeked
+/// to the new position.
+///
+/// On successful completion the number of bytes actually copied will be
+/// returned.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub fn copy_file_range(
+    fd_in: RawFd,
+    off_in: Option<&mut libc::loff_t>,
+    fd_out: RawFd,
+    off_out: Option<&mut libc::loff_t>,
+    len: usize,
+) -> Result<usize> {
+    let off_in = off_in
+        .map(|offset| offset as *mut libc::loff_t)
+        .unwrap_or(ptr::null_mut());
+    let off_out = off_out
+        .map(|offset| offset as *mut libc::loff_t)
+        .unwrap_or(ptr::null_mut());
 
-    let ret = unsafe { libc::splice(fd_in, off_in, fd_out, off_out, len, flags.bits()) };
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_copy_file_range,
+            fd_in,
+            off_in,
+            fd_out,
+            off_out,
+            len,
+            0,
+        )
+    };
+    Errno::result(ret).map(|r| r as usize)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn splice(
+    fd_in: RawFd,
+    off_in: Option<&mut libc::loff_t>,
+    fd_out: RawFd,
+    off_out: Option<&mut libc::loff_t>,
+    len: usize,
+    flags: SpliceFFlags,
+) -> Result<usize> {
+    let off_in = off_in
+        .map(|offset| offset as *mut libc::loff_t)
+        .unwrap_or(ptr::null_mut());
+    let off_out = off_out
+        .map(|offset| offset as *mut libc::loff_t)
+        .unwrap_or(ptr::null_mut());
+
+    let ret = unsafe {
+        libc::splice(fd_in, off_in, fd_out, off_out, len, flags.bits())
+    };
     Errno::result(ret).map(|r| r as usize)
 }
 
@@ -391,4 +471,59 @@ libc_bitflags!(
 pub fn fallocate(fd: RawFd, mode: FallocateFlags, offset: libc::off_t, len: libc::off_t) -> Result<c_int> {
     let res = unsafe { libc::fallocate(fd, mode.bits(), offset, len) };
     Errno::result(res)
+}
+
+#[cfg(any(target_os = "linux",
+          target_os = "android",
+          target_os = "emscripten",
+          target_os = "fuchsia",
+          any(target_os = "wasi", target_env = "wasi"),
+          target_env = "uclibc",
+          target_env = "freebsd"))]
+mod posix_fadvise {
+    use Result;
+    use libc;
+    use errno::Errno;
+    use std::os::unix::io::RawFd;
+
+    libc_enum! {
+        #[repr(i32)]
+        pub enum PosixFadviseAdvice {
+            POSIX_FADV_NORMAL,
+            POSIX_FADV_SEQUENTIAL,
+            POSIX_FADV_RANDOM,
+            POSIX_FADV_NOREUSE,
+            POSIX_FADV_WILLNEED,
+            POSIX_FADV_DONTNEED,
+        }
+    }
+
+    pub fn posix_fadvise(fd: RawFd,
+                         offset: libc::off_t,
+                         len: libc::off_t,
+                         advice: PosixFadviseAdvice) -> Result<libc::c_int> {
+        let res = unsafe { libc::posix_fadvise(fd, offset, len, advice as libc::c_int) };
+        Errno::result(res)
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "emscripten",
+    target_os = "fuchsia",
+    any(target_os = "wasi", target_env = "wasi"),
+    target_os = "freebsd"
+))]
+pub fn posix_fallocate(
+    fd: RawFd,
+    offset: libc::off_t,
+    len: libc::off_t
+) -> Result<()> {
+    let res = unsafe { libc::posix_fallocate(fd, offset, len) };
+    match Errno::result(res) {
+        Err(err) => Err(err),
+        Ok(0) => Ok(()),
+        Ok(errno) => Err(crate::Error::Sys(Errno::from_i32(errno))),
+    }
 }

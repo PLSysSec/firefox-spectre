@@ -82,7 +82,7 @@ mod ptrace {
         assert!(ptrace::setoptions(child, Options::PTRACE_O_TRACESYSGOOD | Options::PTRACE_O_TRACEEXIT).is_ok());
 
         // First, stop on the next system call, which will be exit()
-        assert!(ptrace::syscall(child).is_ok());
+        assert!(ptrace::syscall(child, None).is_ok());
         assert_eq!(waitpid(child, None), Ok(WaitStatus::PtraceSyscall(child)));
         // Then get the ptrace event for the process exiting
         assert!(ptrace::cont(child, None).is_ok());
@@ -94,6 +94,7 @@ mod ptrace {
 
     #[test]
     fn test_wait_ptrace() {
+        require_capability!(CAP_SYS_PTRACE);
         let _m = ::FORK_MTX.lock().expect("Mutex got poisoned by another test");
 
         match fork().expect("Error: Fork Failed") {

@@ -1,6 +1,7 @@
 use libc::{self, c_int};
 use Result;
 use errno::Errno;
+use std::convert::TryFrom;
 use unistd::Pid;
 
 use sys::signal::Signal;
@@ -55,7 +56,7 @@ libc_bitflags!(
 /// Note that there are two Linux-specific enum variants, `PtraceEvent`
 /// and `PtraceSyscall`. Portable code should avoid exhaustively
 /// matching on `WaitStatus`.
-#[derive(Eq, PartialEq, Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum WaitStatus {
     /// The process exited normally (as with `exit()` or returning from
     /// `main`) with the given exit code. This case matches the C macro
@@ -126,7 +127,7 @@ fn signaled(status: i32) -> bool {
 }
 
 fn term_signal(status: i32) -> Result<Signal> {
-    Signal::from_c_int(unsafe { libc::WTERMSIG(status) })
+    Signal::try_from(unsafe { libc::WTERMSIG(status) })
 }
 
 fn dumped_core(status: i32) -> bool {
@@ -138,7 +139,7 @@ fn stopped(status: i32) -> bool {
 }
 
 fn stop_signal(status: i32) -> Result<Signal> {
-    Signal::from_c_int(unsafe { libc::WSTOPSIG(status) })
+    Signal::try_from(unsafe { libc::WSTOPSIG(status) })
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -222,7 +223,7 @@ pub fn waitpid<P: Into<Option<Pid>>>(pid: P, options: Option<WaitPidFlag>) -> Re
 
     let res = unsafe {
         libc::waitpid(
-            pid.into().unwrap_or(Pid::from_raw(-1)).into(),
+            pid.into().unwrap_or_else(|| Pid::from_raw(-1)).into(),
             &mut status as *mut c_int,
             option_bits,
         )

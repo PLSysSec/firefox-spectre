@@ -5,7 +5,7 @@ use {Error, Result, NixPath};
 use fcntl::{AtFlags, at_rawfd, fcntl, FdFlag, OFlag};
 use fcntl::FcntlArg::F_SETFD;
 use libc::{self, c_char, c_void, c_int, c_long, c_uint, size_t, pid_t, off_t,
-           uid_t, gid_t, mode_t};
+           uid_t, gid_t, mode_t, PATH_MAX};
 use std::{fmt, mem, ptr};
 use std::ffi::{CString, CStr, OsString, OsStr};
 use std::os::unix::ffi::{OsStringExt, OsStrExt};
@@ -45,12 +45,12 @@ impl Uid {
     }
 
     /// Returns true if the `Uid` represents privileged user - root. (If it equals zero.)
-    pub fn is_root(&self) -> bool {
-        *self == ROOT
+    pub fn is_root(self) -> bool {
+        self == ROOT
     }
 
     /// Get the raw `uid_t` wrapped by `self`.
-    pub fn as_raw(&self) -> uid_t {
+    pub fn as_raw(self) -> uid_t {
         self.0
     }
 }
@@ -88,13 +88,13 @@ impl Gid {
         getgid()
     }
 
-    /// Returns effective Gid of calling process. This is practically a more Rusty alias for `getgid`.
+    /// Returns effective Gid of calling process. This is practically a more Rusty alias for `getegid`.
     pub fn effective() -> Self {
         getegid()
     }
 
     /// Get the raw `gid_t` wrapped by `self`.
-    pub fn as_raw(&self) -> gid_t {
+    pub fn as_raw(self) -> gid_t {
         self.0
     }
 }
@@ -135,7 +135,7 @@ impl Pid {
     }
 
     /// Get the raw `pid_t` wrapped by `self`.
-    pub fn as_raw(&self) -> pid_t {
+    pub fn as_raw(self) -> pid_t {
         self.0
     }
 }
@@ -168,8 +168,8 @@ impl ForkResult {
 
     /// Return `true` if this is the child process of the `fork()`
     #[inline]
-    pub fn is_child(&self) -> bool {
-        match *self {
+    pub fn is_child(self) -> bool {
+        match self {
             ForkResult::Child => true,
             _ => false
         }
@@ -177,7 +177,7 @@ impl ForkResult {
 
     /// Returns `true` if this is the parent process of the `fork()`
     #[inline]
-    pub fn is_parent(&self) -> bool {
+    pub fn is_parent(self) -> bool {
         !self.is_child()
     }
 }
@@ -506,6 +506,26 @@ pub fn mkfifo<P: ?Sized + NixPath>(path: &P, mode: Mode) -> Result<()> {
     Errno::result(res).map(drop)
 }
 
+/// Creates new fifo special file (named pipe) with path `path` and access rights `mode`.
+/// 
+/// If `dirfd` has a value, then `path` is relative to directory associated with the file descriptor.
+/// 
+/// If `dirfd` is `None`, then `path` is relative to the current working directory. 
+/// 
+/// # References
+/// 
+/// [mkfifoat(2)](http://pubs.opengroup.org/onlinepubs/9699919799/functions/mkfifoat.html).
+// mkfifoat is not implemented in OSX or android
+#[inline]
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+pub fn mkfifoat<P: ?Sized + NixPath>(dirfd: Option<RawFd>, path: &P, mode: Mode) -> Result<()> {
+    let res = path.with_nix_path(|cstr| unsafe {
+        libc::mkfifoat(at_rawfd(dirfd), cstr.as_ptr(), mode.bits() as mode_t)
+    })?;
+
+    Errno::result(res).map(drop)
+}
+
 /// Creates a symbolic link at `path2` which points to `path1`.
 ///
 /// If `dirfd` has a value, then `path2` is relative to directory associated
@@ -532,6 +552,21 @@ pub fn symlinkat<P1: ?Sized + NixPath, P2: ?Sized + NixPath>(
             })
         })??;
     Errno::result(res).map(drop)
+}
+
+// Double the buffer capacity up to limit. In case it already has
+// reached the limit, return Errno::ERANGE.
+fn reserve_double_buffer_size<T>(buf: &mut Vec<T>, limit: usize) -> Result<()> {
+    use std::cmp::min;
+
+    if buf.len() >= limit {
+        return Err(Error::Sys(Errno::ERANGE))
+    }
+
+    let capacity = min(buf.capacity() * 2, limit);
+    buf.reserve(capacity);
+
+    Ok(())
 }
 
 /// Returns the current directory as a `PathBuf`
@@ -576,11 +611,8 @@ pub fn getcwd() -> Result<PathBuf> {
                 }
             }
 
-            // Trigger the internal buffer resizing logic of `Vec` by requiring
-            // more space than the current capacity.
-            let cap = buf.capacity();
-            buf.set_len(cap);
-            buf.reserve(1);
+            // Trigger the internal buffer resizing logic.
+            reserve_double_buffer_size(&mut buf, PATH_MAX as usize)?;
         }
     }
 }
@@ -590,8 +622,10 @@ fn chown_raw_ids(owner: Option<Uid>, group: Option<Gid>) -> (libc::uid_t, libc::
     // According to the POSIX specification, -1 is used to indicate that owner and group
     // are not to be changed.  Since uid_t and gid_t are unsigned types, we have to wrap
     // around to get -1.
-    let uid = owner.map(Into::into).unwrap_or((0 as uid_t).wrapping_sub(1));
-    let gid = group.map(Into::into).unwrap_or((0 as gid_t).wrapping_sub(1));
+    let uid = owner.map(Into::into)
+        .unwrap_or_else(|| (0 as uid_t).wrapping_sub(1));
+    let gid = group.map(Into::into)
+        .unwrap_or_else(|| (0 as gid_t).wrapping_sub(1));
     (uid, gid)
 }
 
@@ -661,10 +695,9 @@ pub fn fchownat<P: ?Sized + NixPath>(
     Errno::result(res).map(drop)
 }
 
-fn to_exec_array(args: &[CString]) -> Vec<*const c_char> {
-    let mut args_p: Vec<*const c_char> = args.iter().map(|s| s.as_ptr()).collect();
-    args_p.push(ptr::null());
-    args_p
+fn to_exec_array(args: &[&CStr]) -> Vec<*const c_char> {
+    use std::iter::once;
+    args.iter().map(|s| s.as_ptr()).chain(once(ptr::null())).collect()
 }
 
 /// Replace the current process image with a new one (see
@@ -674,7 +707,7 @@ fn to_exec_array(args: &[CString]) -> Vec<*const c_char> {
 /// performs the same action but does not allow for customization of the
 /// environment for the new process.
 #[inline]
-pub fn execv(path: &CString, argv: &[CString]) -> Result<Void> {
+pub fn execv(path: &CStr, argv: &[&CStr]) -> Result<Void> {
     let args_p = to_exec_array(argv);
 
     unsafe {
@@ -698,7 +731,7 @@ pub fn execv(path: &CString, argv: &[CString]) -> Result<Void> {
 /// in the `args` list is an argument to the new process. Each element in the
 /// `env` list should be a string in the form "key=value".
 #[inline]
-pub fn execve(path: &CString, args: &[CString], env: &[CString]) -> Result<Void> {
+pub fn execve(path: &CStr, args: &[&CStr], env: &[&CStr]) -> Result<Void> {
     let args_p = to_exec_array(args);
     let env_p = to_exec_array(env);
 
@@ -719,7 +752,7 @@ pub fn execve(path: &CString, args: &[CString], env: &[CString]) -> Result<Void>
 /// would not work if "bash" was specified for the path argument, but `execvp`
 /// would assuming that a bash executable was on the system `PATH`.
 #[inline]
-pub fn execvp(filename: &CString, args: &[CString]) -> Result<Void> {
+pub fn execvp(filename: &CStr, args: &[&CStr]) -> Result<Void> {
     let args_p = to_exec_array(args);
 
     unsafe {
@@ -739,7 +772,7 @@ pub fn execvp(filename: &CString, args: &[CString]) -> Result<Void> {
 #[cfg(any(target_os = "haiku",
           target_os = "linux",
           target_os = "openbsd"))]
-pub fn execvpe(filename: &CString, args: &[CString], env: &[CString]) -> Result<Void> {
+pub fn execvpe(filename: &CStr, args: &[&CStr], env: &[&CStr]) -> Result<Void> {
     let args_p = to_exec_array(args);
     let env_p = to_exec_array(env);
 
@@ -767,7 +800,7 @@ pub fn execvpe(filename: &CString, args: &[CString], env: &[CString]) -> Result<
           target_os = "linux",
           target_os = "freebsd"))]
 #[inline]
-pub fn fexecve(fd: RawFd, args: &[CString], env: &[CString]) -> Result<Void> {
+pub fn fexecve(fd: RawFd, args: &[&CStr], env: &[&CStr]) -> Result<Void> {
     let args_p = to_exec_array(args);
     let env_p = to_exec_array(env);
 
@@ -790,8 +823,8 @@ pub fn fexecve(fd: RawFd, args: &[CString], env: &[CString]) -> Result<Void> {
 /// is referenced as a file descriptor to the base directory plus a path.
 #[cfg(any(target_os = "android", target_os = "linux"))]
 #[inline]
-pub fn execveat(dirfd: RawFd, pathname: &CString, args: &[CString],
-                env: &[CString], flags: super::fcntl::AtFlags) -> Result<Void> {
+pub fn execveat(dirfd: RawFd, pathname: &CStr, args: &[&CStr],
+                env: &[&CStr], flags: super::fcntl::AtFlags) -> Result<Void> {
     let args_p = to_exec_array(args);
     let env_p = to_exec_array(env);
 
@@ -1007,13 +1040,13 @@ pub fn lseek64(fd: RawFd, offset: libc::off64_t, whence: Whence) -> Result<libc:
 /// See also [pipe(2)](http://pubs.opengroup.org/onlinepubs/9699919799/functions/pipe.html)
 pub fn pipe() -> Result<(RawFd, RawFd)> {
     unsafe {
-        let mut fds: [c_int; 2] = mem::uninitialized();
+        let mut fds = mem::MaybeUninit::<[c_int; 2]>::uninit();
 
-        let res = libc::pipe(fds.as_mut_ptr());
+        let res = libc::pipe(fds.as_mut_ptr() as *mut c_int);
 
         Errno::result(res)?;
 
-        Ok((fds[0], fds[1]))
+        Ok((fds.assume_init()[0], fds.assume_init()[1]))
     }
 }
 
@@ -1034,13 +1067,15 @@ pub fn pipe() -> Result<(RawFd, RawFd)> {
           target_os = "netbsd",
           target_os = "openbsd"))]
 pub fn pipe2(flags: OFlag) -> Result<(RawFd, RawFd)> {
-    let mut fds: [c_int; 2] = unsafe { mem::uninitialized() };
+    let mut fds = mem::MaybeUninit::<[c_int; 2]>::uninit();
 
-    let res = unsafe { libc::pipe2(fds.as_mut_ptr(), flags.bits()) };
+    let res = unsafe {
+        libc::pipe2(fds.as_mut_ptr() as *mut c_int, flags.bits())
+    };
 
     Errno::result(res)?;
 
-    Ok((fds[0], fds[1]))
+    unsafe { Ok((fds.assume_init()[0], fds.assume_init()[1])) }
 }
 
 /// Like `pipe`, but allows setting certain file descriptor flags.
@@ -1056,15 +1091,17 @@ pub fn pipe2(flags: OFlag) -> Result<(RawFd, RawFd)> {
     note="pipe2(2) is not actually atomic on these platforms.  Use pipe(2) and fcntl(2) instead"
 )]
 pub fn pipe2(flags: OFlag) -> Result<(RawFd, RawFd)> {
-    let mut fds: [c_int; 2] = unsafe { mem::uninitialized() };
+    let mut fds = mem::MaybeUninit::<[c_int; 2]>::uninit();
 
-    let res = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    let res = unsafe { libc::pipe(fds.as_mut_ptr() as *mut c_int) };
 
     Errno::result(res)?;
 
-    pipe2_setflags(fds[0], fds[1], flags)?;
+    unsafe {
+        pipe2_setflags(fds.assume_init()[0], fds.assume_init()[1], flags)?;
 
-    Ok((fds[0], fds[1]))
+        Ok((fds.assume_init()[0], fds.assume_init()[1]))
+    }
 }
 
 #[cfg(any(target_os = "ios", target_os = "macos"))]
@@ -1132,6 +1169,58 @@ pub fn isatty(fd: RawFd) -> Result<bool> {
     }
 }
 
+/// Flags for `linkat` function.
+#[derive(Clone, Copy, Debug)]
+pub enum LinkatFlags {
+    SymlinkFollow,
+    NoSymlinkFollow,
+}
+
+/// Link one file to another file
+///
+/// Creates a new link (directory entry) at `newpath` for the existing file at `oldpath`. In the
+/// case of a relative `oldpath`, the path is interpreted relative to the directory associated
+/// with file descriptor `olddirfd` instead of the current working directory and similiarly for
+/// `newpath` and file descriptor `newdirfd`. In case `flag` is LinkatFlags::SymlinkFollow and
+/// `oldpath` names a symoblic link, a new link for the target of the symbolic link is created.
+/// If either `olddirfd` or `newdirfd` is `None`, `AT_FDCWD` is used respectively where `oldpath`
+/// and/or `newpath` is then interpreted relative to the current working directory of the calling
+/// process. If either `oldpath` or `newpath` is absolute, then `dirfd` is ignored.
+///
+/// # References
+/// See also [linkat(2)](http://pubs.opengroup.org/onlinepubs/9699919799/functions/linkat.html)
+pub fn linkat<P: ?Sized + NixPath>(
+    olddirfd: Option<RawFd>,
+    oldpath: &P,
+    newdirfd: Option<RawFd>,
+    newpath: &P,
+    flag: LinkatFlags,
+) -> Result<()> {
+
+    let atflag =
+        match flag {
+            LinkatFlags::SymlinkFollow => AtFlags::AT_SYMLINK_FOLLOW,
+            LinkatFlags::NoSymlinkFollow => AtFlags::empty(),
+        };
+
+    let res =
+        oldpath.with_nix_path(|oldcstr| {
+            newpath.with_nix_path(|newcstr| {
+            unsafe {
+                libc::linkat(
+                    at_rawfd(olddirfd),
+                    oldcstr.as_ptr(),
+                    at_rawfd(newdirfd),
+                    newcstr.as_ptr(),
+                    atflag.bits() as libc::c_int
+                    )
+                }
+            })
+        })??;
+    Errno::result(res).map(drop)
+}
+
+
 /// Remove a directory entry
 ///
 /// See also [unlink(2)](http://pubs.opengroup.org/onlinepubs/9699919799/functions/unlink.html)
@@ -1143,6 +1232,42 @@ pub fn unlink<P: ?Sized + NixPath>(path: &P) -> Result<()> {
     })?;
     Errno::result(res).map(drop)
 }
+
+/// Flags for `unlinkat` function.
+#[derive(Clone, Copy, Debug)]
+pub enum UnlinkatFlags {
+    RemoveDir,
+    NoRemoveDir,
+}
+
+/// Remove a directory entry
+///
+/// In the case of a relative path, the directory entry to be removed is determined relative to
+/// the directory associated with the file descriptor `dirfd` or the current working directory
+/// if `dirfd` is `None`. In the case of an absolute `path` `dirfd` is ignored. If `flag` is
+/// `UnlinkatFlags::RemoveDir` then removal of the directory entry specified by `dirfd` and `path`
+/// is performed.
+///
+/// # References
+/// See also [unlinkat(2)](http://pubs.opengroup.org/onlinepubs/9699919799/functions/unlinkat.html)
+pub fn unlinkat<P: ?Sized + NixPath>(
+    dirfd: Option<RawFd>,
+    path: &P,
+    flag: UnlinkatFlags,
+) -> Result<()> {
+    let atflag =
+        match flag {
+            UnlinkatFlags::RemoveDir => AtFlags::AT_REMOVEDIR,
+            UnlinkatFlags::NoRemoveDir => AtFlags::empty(),
+        };
+    let res = path.with_nix_path(|cstr| {
+        unsafe {
+            libc::unlinkat(at_rawfd(dirfd), cstr.as_ptr(), atflag.bits() as libc::c_int)
+        }
+    })?;
+    Errno::result(res).map(drop)
+}
+
 
 #[inline]
 pub fn chroot<P: ?Sized + NixPath>(path: &P) -> Result<()> {
@@ -1163,7 +1288,7 @@ pub fn chroot<P: ?Sized + NixPath>(path: &P) -> Result<()> {
     target_os = "netbsd",
     target_os = "openbsd"
 ))]
-pub fn sync() -> () {
+pub fn sync() {
     unsafe { libc::sync() };
 }
 
@@ -1233,6 +1358,26 @@ pub fn getegid() -> Gid {
     Gid(unsafe { libc::getegid() })
 }
 
+/// Set the effective user ID
+///
+/// See also [seteuid(2)](http://pubs.opengroup.org/onlinepubs/9699919799/functions/seteuid.html)
+#[inline]
+pub fn seteuid(euid: Uid) -> Result<()> {
+    let res = unsafe { libc::seteuid(euid.into()) };
+
+    Errno::result(res).map(drop)
+}
+
+/// Set the effective group ID
+///
+/// See also [setegid(2)](http://pubs.opengroup.org/onlinepubs/9699919799/functions/setegid.html)
+#[inline]
+pub fn setegid(egid: Gid) -> Result<()> {
+    let res = unsafe { libc::setegid(egid.into()) };
+
+    Errno::result(res).map(drop)
+}
+
 /// Set the user ID
 ///
 /// See also [setuid(2)](http://pubs.opengroup.org/onlinepubs/9699919799/functions/setuid.html)
@@ -1243,7 +1388,7 @@ pub fn setuid(uid: Uid) -> Result<()> {
     Errno::result(res).map(drop)
 }
 
-/// Set the user ID
+/// Set the group ID
 ///
 /// See also [setgid(2)](http://pubs.opengroup.org/onlinepubs/9699919799/functions/setgid.html)
 #[inline]
@@ -1262,33 +1407,39 @@ pub fn setgid(gid: Gid) -> Result<()> {
 /// with the `opendirectoryd` service.
 #[cfg(not(any(target_os = "ios", target_os = "macos")))]
 pub fn getgroups() -> Result<Vec<Gid>> {
-    // First get the number of groups so we can size our Vec
-    let ret = unsafe { libc::getgroups(0, ptr::null_mut()) };
+    // First get the maximum number of groups. The value returned
+    // shall always be greater than or equal to one and less than or
+    // equal to the value of {NGROUPS_MAX} + 1.
+    let ngroups_max = match sysconf(SysconfVar::NGROUPS_MAX) {
+        Ok(Some(n)) => (n + 1) as usize,
+        Ok(None) | Err(_) => <usize>::max_value(),
+    };
+
+    // Next, get the number of groups so we can size our Vec
+    let ngroups = unsafe { libc::getgroups(0, ptr::null_mut()) };
 
     // Now actually get the groups. We try multiple times in case the number of
     // groups has changed since the first call to getgroups() and the buffer is
     // now too small.
-    let mut groups = Vec::<Gid>::with_capacity(Errno::result(ret)? as usize);
+    let mut groups = Vec::<Gid>::with_capacity(Errno::result(ngroups)? as usize);
     loop {
         // FIXME: On the platforms we currently support, the `Gid` struct has
         // the same representation in memory as a bare `gid_t`. This is not
         // necessarily the case on all Rust platforms, though. See RFC 1785.
-        let ret = unsafe {
+        let ngroups = unsafe {
             libc::getgroups(groups.capacity() as c_int, groups.as_mut_ptr() as *mut gid_t)
         };
 
-        match Errno::result(ret) {
+        match Errno::result(ngroups) {
             Ok(s) => {
                 unsafe { groups.set_len(s as usize) };
                 return Ok(groups);
             },
             Err(Error::Sys(Errno::EINVAL)) => {
-                // EINVAL indicates that the buffer size was too small. Trigger
-                // the internal buffer resizing logic of `Vec` by requiring
-                // more space than the current capacity.
-                let cap = groups.capacity();
-                unsafe { groups.set_len(cap) };
-                groups.reserve(1);
+                // EINVAL indicates that the buffer size was too
+                // small, resize it up to ngroups_max as limit.
+                reserve_double_buffer_size(&mut groups, ngroups_max)
+                    .or(Err(Error::Sys(Errno::EINVAL)))?;
             },
             Err(e) => return Err(e)
         }
@@ -1406,19 +1557,8 @@ pub fn getgrouplist(user: &CStr, group: Gid) -> Result<Vec<Gid>> {
             // BSD systems will still fill the groups buffer with as many
             // groups as possible, but Linux manpages do not mention this
             // behavior.
-
-            let cap = groups.capacity();
-            if cap >= ngroups_max as usize {
-                // We already have the largest capacity we can, give up
-                return Err(Error::invalid_argument());
-            }
-
-            // Reserve space for at least ngroups
-            groups.reserve(ngroups as usize);
-
-            // Even if the buffer gets resized to bigger than ngroups_max,
-            // don't ever ask for more than ngroups_max groups
-            ngroups = min(ngroups_max, groups.capacity() as c_int);
+            reserve_double_buffer_size(&mut groups, ngroups_max as usize)
+                .or_else(|_| Err(Error::invalid_argument()))?;
         }
     }
 }
@@ -1854,7 +1994,8 @@ pub enum SysconfVar {
     BC_STRING_MAX = libc::_SC_BC_STRING_MAX,
     /// Maximum number of simultaneous processes per real user ID.
     CHILD_MAX = libc::_SC_CHILD_MAX,
-    // _SC_CLK_TCK is obsolete
+    // The number of clock ticks per second.
+    CLK_TCK = libc::_SC_CLK_TCK,
     /// Maximum number of weights that can be assigned to an entry of the
     /// LC_COLLATE order keyword in the locale definition file
     COLL_WEIGHTS_MAX = libc::_SC_COLL_WEIGHTS_MAX,
@@ -2309,5 +2450,282 @@ mod setres {
         let res = unsafe { libc::setresgid(rgid.into(), egid.into(), sgid.into()) };
 
         Errno::result(res).map(drop)
+    }
+}
+
+libc_bitflags!{
+    /// Options for access()
+    pub struct AccessFlags : c_int {
+        /// Test for existence of file.
+        F_OK;
+        /// Test for read permission.
+        R_OK;
+        /// Test for write permission.
+        W_OK;
+        /// Test for execute (search) permission.
+        X_OK;
+    }
+}
+
+/// Checks the file named by `path` for accessibility according to the flags given by `amode`
+/// See [access(2)](http://pubs.opengroup.org/onlinepubs/9699919799/functions/access.html)
+pub fn access<P: ?Sized + NixPath>(path: &P, amode: AccessFlags) -> Result<()> {
+    let res = path.with_nix_path(|cstr| {
+        unsafe {
+            libc::access(cstr.as_ptr(), amode.bits)
+        }
+    })?;
+    Errno::result(res).map(drop)
+}
+
+/// Representation of a User, based on `libc::passwd`
+///
+/// The reason some fields in this struct are `String` and others are `CString` is because some
+/// fields are based on the user's locale, which could be non-UTF8, while other fields are
+/// guaranteed to conform to [`NAME_REGEX`](https://serverfault.com/a/73101/407341), which only
+/// contains ASCII.
+#[derive(Debug, Clone, PartialEq)]
+pub struct User {
+    /// Username
+    pub name: String,
+    /// User password (probably encrypted)
+    pub passwd: CString,
+    /// User ID
+    pub uid: Uid,
+    /// Group ID
+    pub gid: Gid,
+    /// User information
+    #[cfg(not(target_os = "android"))]
+    pub gecos: CString,
+    /// Home directory
+    pub dir: PathBuf,
+    /// Path to shell
+    pub shell: PathBuf,
+    /// Login class
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    pub class: CString,
+    /// Last password change
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    pub change: libc::time_t,
+    /// Expiration time of account
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    pub expire: libc::time_t
+}
+
+impl From<&libc::passwd> for User {
+    fn from(pw: &libc::passwd) -> User {
+        unsafe {
+            User {
+                name: CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned(),
+                passwd: CString::new(CStr::from_ptr((*pw).pw_passwd).to_bytes()).unwrap(),
+                #[cfg(not(target_os = "android"))]
+                gecos: CString::new(CStr::from_ptr((*pw).pw_gecos).to_bytes()).unwrap(),
+                dir: PathBuf::from(OsStr::from_bytes(CStr::from_ptr((*pw).pw_dir).to_bytes())),
+                shell: PathBuf::from(OsStr::from_bytes(CStr::from_ptr((*pw).pw_shell).to_bytes())),
+                uid: Uid::from_raw((*pw).pw_uid),
+                gid: Gid::from_raw((*pw).pw_gid),
+                #[cfg(not(any(target_os = "android", target_os = "linux")))]
+                class: CString::new(CStr::from_ptr((*pw).pw_class).to_bytes()).unwrap(),
+                #[cfg(not(any(target_os = "android", target_os = "linux")))]
+                change: (*pw).pw_change,
+                #[cfg(not(any(target_os = "android", target_os = "linux")))]
+                expire: (*pw).pw_expire
+            }
+        }
+    }
+}
+
+impl User {
+    fn from_anything<F>(f: F) -> Result<Option<Self>>
+    where
+        F: Fn(*mut libc::passwd,
+              *mut libc::c_char,
+              libc::size_t,
+              *mut *mut libc::passwd) -> libc::c_int
+    {
+        let buflimit = 16384;
+        let bufsize = match sysconf(SysconfVar::GETPW_R_SIZE_MAX) {
+            Ok(Some(n)) => n as usize,
+            Ok(None) | Err(_) => buflimit as usize,
+        };
+
+        let mut cbuf = Vec::with_capacity(bufsize);
+        let mut pwd = mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut res = ptr::null_mut();
+
+        loop {
+            let error = f(pwd.as_mut_ptr(), cbuf.as_mut_ptr(), cbuf.capacity(), &mut res);
+            if error == 0 {
+                if res.is_null() {
+                    return Ok(None);
+                } else {
+                    let pwd = unsafe { pwd.assume_init() };
+                    return Ok(Some(User::from(&pwd)));
+                }
+            } else if Errno::last() == Errno::ERANGE {
+                // Trigger the internal buffer resizing logic.
+                reserve_double_buffer_size(&mut cbuf, buflimit)?;
+            } else {
+                return Err(Error::Sys(Errno::last()));
+            }
+        }
+    }
+
+    /// Get a user by UID.
+    ///
+    /// Internally, this function calls
+    /// [getpwuid_r(3)](http://pubs.opengroup.org/onlinepubs/9699919799/functions/getpwuid_r.html)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use nix::unistd::{Uid, User};
+    /// // Returns an Result<Option<User>>, thus the double unwrap.
+    /// let res = User::from_uid(Uid::from_raw(0)).unwrap().unwrap();
+    /// assert!(res.name == "root");
+    /// ```
+    pub fn from_uid(uid: Uid) -> Result<Option<Self>> {
+        User::from_anything(|pwd, cbuf, cap, res| {
+            unsafe { libc::getpwuid_r(uid.0, pwd, cbuf, cap, res) }
+        })
+    }
+
+    /// Get a user by name.
+    ///
+    /// Internally, this function calls
+    /// [getpwnam_r(3)](http://pubs.opengroup.org/onlinepubs/9699919799/functions/getpwuid_r.html)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use nix::unistd::User;
+    /// // Returns an Result<Option<User>>, thus the double unwrap.
+    /// let res = User::from_name("root").unwrap().unwrap();
+    /// assert!(res.name == "root");
+    /// ```
+    pub fn from_name(name: &str) -> Result<Option<Self>> {
+        let name = CString::new(name).unwrap();
+        User::from_anything(|pwd, cbuf, cap, res| {
+            unsafe { libc::getpwnam_r(name.as_ptr(), pwd, cbuf, cap, res) }
+        })
+    }
+}
+
+/// Representation of a Group, based on `libc::group`
+#[derive(Debug, Clone, PartialEq)]
+pub struct Group {
+    /// Group name
+    pub name: String,
+    /// Group ID
+    pub gid: Gid,
+    /// List of Group members
+    pub mem: Vec<String>
+}
+
+impl From<&libc::group> for Group {
+    fn from(gr: &libc::group) -> Group {
+        unsafe {
+            Group {
+                name: CStr::from_ptr((*gr).gr_name).to_string_lossy().into_owned(),
+                gid: Gid::from_raw((*gr).gr_gid),
+                mem: Group::members((*gr).gr_mem)
+            }
+        }
+    }
+}
+
+impl Group {
+    unsafe fn members(mem: *mut *mut c_char) -> Vec<String> {
+        let mut ret = Vec::new();
+
+        for i in 0.. {
+            let u = mem.offset(i);
+            if (*u).is_null() {
+                break;
+            } else {
+                let s = CStr::from_ptr(*u).to_string_lossy().into_owned();
+                ret.push(s);
+            }
+        }
+
+        ret
+    }
+
+    fn from_anything<F>(f: F) -> Result<Option<Self>>
+    where
+        F: Fn(*mut libc::group,
+              *mut libc::c_char,
+              libc::size_t,
+              *mut *mut libc::group) -> libc::c_int
+    {
+        let buflimit = 16384;
+        let bufsize = match sysconf(SysconfVar::GETGR_R_SIZE_MAX) {
+            Ok(Some(n)) => n as usize,
+            Ok(None) | Err(_) => buflimit as usize,
+        };
+
+        let mut cbuf = Vec::with_capacity(bufsize);
+        let mut grp = mem::MaybeUninit::<libc::group>::uninit();
+        let mut res = ptr::null_mut();
+
+        loop {
+            let error = f(grp.as_mut_ptr(), cbuf.as_mut_ptr(), cbuf.capacity(), &mut res);
+            if error == 0 {
+                if res.is_null() {
+                    return Ok(None);
+                } else {
+                    let grp = unsafe { grp.assume_init() };
+                    return Ok(Some(Group::from(&grp)));
+                }
+            } else if Errno::last() == Errno::ERANGE {
+                // Trigger the internal buffer resizing logic.
+                reserve_double_buffer_size(&mut cbuf, buflimit)?;
+            } else {
+                return Err(Error::Sys(Errno::last()));
+            }
+        }
+    }
+
+    /// Get a group by GID.
+    ///
+    /// Internally, this function calls
+    /// [getgrgid_r(3)](http://pubs.opengroup.org/onlinepubs/9699919799/functions/getpwuid_r.html)
+    ///
+    /// # Examples
+    ///
+    // Disable this test on all OS except Linux as root group may not exist.
+    #[cfg_attr(not(target_os = "linux"), doc = " ```no_run")]
+    #[cfg_attr(target_os = "linux", doc = " ```")]
+    /// use nix::unistd::{Gid, Group};
+    /// // Returns an Result<Option<Group>>, thus the double unwrap.
+    /// let res = Group::from_gid(Gid::from_raw(0)).unwrap().unwrap();
+    /// assert!(res.name == "root");
+    /// ```
+    pub fn from_gid(gid: Gid) -> Result<Option<Self>> {
+        Group::from_anything(|grp, cbuf, cap, res| {
+            unsafe { libc::getgrgid_r(gid.0, grp, cbuf, cap, res) }
+        })
+    }
+
+    /// Get a group by name.
+    ///
+    /// Internally, this function calls
+    /// [getgrnam_r(3)](http://pubs.opengroup.org/onlinepubs/9699919799/functions/getpwuid_r.html)
+    ///
+    /// # Examples
+    ///
+    // Disable this test on all OS except Linux as root group may not exist.
+    #[cfg_attr(not(target_os = "linux"), doc = " ```no_run")]
+    #[cfg_attr(target_os = "linux", doc = " ```")]
+    /// use nix::unistd::Group;
+    /// // Returns an Result<Option<Group>>, thus the double unwrap.
+    /// let res = Group::from_name("root").unwrap().unwrap();
+    /// assert!(res.name == "root");
+    /// ```
+    pub fn from_name(name: &str) -> Result<Option<Self>> {
+        let name = CString::new(name).unwrap();
+        Group::from_anything(|grp, cbuf, cap, res| {
+            unsafe { libc::getgrnam_r(name.as_ptr(), grp, cbuf, cap, res) }
+        })
     }
 }

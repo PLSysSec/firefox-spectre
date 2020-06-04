@@ -1,10 +1,14 @@
-use crate::alloc::borrow::Cow;
-use crate::{Relocation, SectionIndex, SectionKind, Symbol, SymbolIndex, SymbolMap};
+#[cfg(feature = "compression")]
+use alloc::borrow::Cow;
 use target_lexicon::{Architecture, Endianness};
-use uuid::Uuid;
+
+use crate::read::{self, Result};
+use crate::{
+    FileFlags, Relocation, SectionFlags, SectionIndex, SectionKind, Symbol, SymbolIndex, SymbolMap,
+};
 
 /// An object file.
-pub trait Object<'data, 'file> {
+pub trait Object<'data, 'file>: read::private::Sealed {
     /// A segment in the object file.
     type Segment: ObjectSegment<'data>;
 
@@ -57,6 +61,8 @@ pub trait Object<'data, 'file> {
     ///
     /// For some object files, multiple segments may contain sections with the same
     /// name. In this case, the first matching section will be used.
+    ///
+    /// This method skips over sections with invalid names.
     fn section_by_name(&'file self, section_name: &str) -> Option<Self::Section>;
 
     /// Get the section at the given index.
@@ -64,27 +70,19 @@ pub trait Object<'data, 'file> {
     /// The meaning of the index depends on the object file.
     ///
     /// For some object files, this requires iterating through all sections.
-    fn section_by_index(&'file self, index: SectionIndex) -> Option<Self::Section>;
-
-    /// Get the contents of the section named `section_name`, if such
-    /// a section exists.
     ///
-    /// The `section_name` is interpreted according to `Self::section_by_name`.
-    ///
-    /// This may decompress section data.
-    fn section_data_by_name(&'file self, section_name: &str) -> Option<Cow<'data, [u8]>> {
-        self.section_by_name(section_name)
-            .map(|section| section.uncompressed_data())
-    }
+    /// Returns an error if the index is invalid.
+    fn section_by_index(&'file self, index: SectionIndex) -> Result<Self::Section>;
 
     /// Get an iterator over the sections in the file.
     fn sections(&'file self) -> Self::SectionIterator;
 
     /// Get the debugging symbol at the given index.
     ///
-    /// This is similar to `self.symbols().nth(index)`, except that
-    /// the index will take into account malformed or unsupported symbols.
-    fn symbol_by_index(&self, index: SymbolIndex) -> Option<Symbol<'data>>;
+    /// The meaning of the index depends on the object file.
+    ///
+    /// Returns an error if the index is invalid.
+    fn symbol_by_index(&self, index: SymbolIndex) -> Result<Symbol<'data>>;
 
     /// Get an iterator over the debugging symbols in the file.
     ///
@@ -92,18 +90,26 @@ pub trait Object<'data, 'file> {
     fn symbols(&'file self) -> Self::SymbolIterator;
 
     /// Get the data for the given symbol.
-    fn symbol_data(&'file self, symbol: &Symbol<'data>) -> Option<&'data [u8]> {
+    ///
+    /// This may iterate over segments.
+    ///
+    /// Returns `Ok(None)` for undefined symbols or if the data could not be found.
+    fn symbol_data(&'file self, symbol: &Symbol<'data>) -> Result<Option<&'data [u8]>> {
         if symbol.is_undefined() {
-            return None;
+            return Ok(None);
         }
         let address = symbol.address();
         let size = symbol.size();
         if let Some(index) = symbol.section_index() {
-            self.section_by_index(index)
-                .and_then(|section| section.data_range(address, size))
+            let section = self.section_by_index(index)?;
+            section.data_range(address, size)
         } else {
-            self.segments()
-                .find_map(|segment| segment.data_range(address, size))
+            for segment in self.segments() {
+                if let Some(data) = segment.data_range(address, size)? {
+                    return Ok(Some(data));
+                }
+            }
+            Ok(None)
         }
     }
 
@@ -120,28 +126,31 @@ pub trait Object<'data, 'file> {
 
     /// The UUID from a Mach-O `LC_UUID` load command.
     #[inline]
-    fn mach_uuid(&self) -> Option<Uuid> {
-        None
+    fn mach_uuid(&self) -> Result<Option<[u8; 16]>> {
+        Ok(None)
     }
 
     /// The build ID from an ELF `NT_GNU_BUILD_ID` note.
     #[inline]
-    fn build_id(&self) -> Option<&'data [u8]> {
-        None
+    fn build_id(&self) -> Result<Option<&'data [u8]>> {
+        Ok(None)
     }
 
     /// The filename and CRC from a `.gnu_debuglink` section.
     #[inline]
-    fn gnu_debuglink(&self) -> Option<(&'data [u8], u32)> {
-        None
+    fn gnu_debuglink(&self) -> Result<Option<(&'data [u8], u32)>> {
+        Ok(None)
     }
+
+    /// File flags that are specific to each file format.
+    fn flags(&self) -> FileFlags;
 }
 
 /// A loadable segment defined in an object file.
 ///
 /// For ELF, this is a program header with type `PT_LOAD`.
 /// For Mach-O, this is a load command with type `LC_SEGMENT` or `LC_SEGMENT_64`.
-pub trait ObjectSegment<'data> {
+pub trait ObjectSegment<'data>: read::private::Sealed {
     /// Returns the virtual address of the segment.
     fn address(&self) -> u64;
 
@@ -155,19 +164,22 @@ pub trait ObjectSegment<'data> {
     fn file_range(&self) -> (u64, u64);
 
     /// Returns a reference to the file contents of the segment.
+    ///
     /// The length of this data may be different from the size of the
     /// segment in memory.
-    fn data(&self) -> &'data [u8];
+    fn data(&self) -> Result<&'data [u8]>;
 
     /// Return the segment data in the given range.
-    fn data_range(&self, address: u64, size: u64) -> Option<&'data [u8]>;
+    ///
+    /// Returns `Ok(None)` if the segment does not contain the given range.
+    fn data_range(&self, address: u64, size: u64) -> Result<Option<&'data [u8]>>;
 
     /// Returns the name of the segment.
-    fn name(&self) -> Option<&str>;
+    fn name(&self) -> Result<Option<&str>>;
 }
 
 /// A section defined in an object file.
-pub trait ObjectSection<'data> {
+pub trait ObjectSection<'data>: read::private::Sealed {
     /// An iterator over the relocations for a section.
     ///
     /// The first field in the item tuple is the section offset
@@ -186,35 +198,46 @@ pub trait ObjectSection<'data> {
     /// Returns the alignment of the section in memory.
     fn align(&self) -> u64;
 
-    /// Returns offset and size of on-disk segment (if any)
+    /// Returns offset and size of on-disk segment (if any).
     fn file_range(&self) -> Option<(u64, u64)>;
 
     /// Returns the raw contents of the section.
+    ///
     /// The length of this data may be different from the size of the
     /// section in memory.
     ///
     /// This does not do any decompression.
-    fn data(&self) -> Cow<'data, [u8]>;
+    fn data(&self) -> Result<&'data [u8]>;
 
     /// Return the raw contents of the section data in the given range.
     ///
     /// This does not do any decompression.
-    fn data_range(&self, address: u64, size: u64) -> Option<&'data [u8]>;
+    ///
+    /// Returns `Ok(None)` if the section does not contain the given range.
+    fn data_range(&self, address: u64, size: u64) -> Result<Option<&'data [u8]>>;
 
     /// Returns the uncompressed contents of the section.
+    ///
     /// The length of this data may be different from the size of the
     /// section in memory.
-    fn uncompressed_data(&self) -> Cow<'data, [u8]>;
+    ///
+    /// If no compression is detected, then returns the data unchanged.
+    /// Returns `Err` if decompression fails.
+    #[cfg(feature = "compression")]
+    fn uncompressed_data(&self) -> Result<Cow<'data, [u8]>>;
 
     /// Returns the name of the section.
-    fn name(&self) -> Option<&str>;
+    fn name(&self) -> Result<&str>;
 
     /// Returns the name of the segment for this section.
-    fn segment_name(&self) -> Option<&str>;
+    fn segment_name(&self) -> Result<Option<&str>>;
 
     /// Return the kind of this section.
     fn kind(&self) -> SectionKind;
 
     /// Get the relocations for this section.
     fn relocations(&self) -> Self::RelocationIterator;
+
+    /// Section flags that are specific to each file format.
+    fn flags(&self) -> SectionFlags;
 }

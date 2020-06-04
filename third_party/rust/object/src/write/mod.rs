@@ -1,22 +1,48 @@
 //! Interface for writing object files.
 
-#![allow(clippy::collapsible_if)]
 #![allow(clippy::cognitive_complexity)]
-#![allow(clippy::module_inception)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::comparison_chain)]
+#![allow(clippy::single_match)]
+#![allow(clippy::useless_let_if_seq)]
 
-use scroll::Pwrite;
 use std::collections::HashMap;
 use std::string::String;
+use std::vec::Vec;
+use std::{error, fmt, result, str};
 
-use crate::alloc::vec::Vec;
+use crate::endian::{RunTimeEndian, U32, U64};
+use crate::pod::BytesMut;
 use crate::target_lexicon::{Architecture, BinaryFormat, Endianness, PointerWidth};
-use crate::{RelocationEncoding, RelocationKind, SectionKind, SymbolKind, SymbolScope};
+use crate::{
+    FileFlags, RelocationEncoding, RelocationKind, SectionFlags, SectionKind, SymbolFlags,
+    SymbolKind, SymbolScope,
+};
 
+#[cfg(feature = "coff")]
 mod coff;
+#[cfg(feature = "elf")]
 mod elf;
+#[cfg(feature = "macho")]
 mod macho;
 mod string;
 mod util;
+
+/// The error type used within the write module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Error(String);
+
+impl fmt::Display for Error {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl error::Error for Error {}
+
+/// The result type used within the write module.
+pub type Result<T> = result::Result<T, Error>;
 
 /// A writable object file.
 #[derive(Debug)]
@@ -28,7 +54,8 @@ pub struct Object {
     symbols: Vec<Symbol>,
     symbol_map: HashMap<Vec<u8>, SymbolId>,
     stub_symbols: HashMap<SymbolId, SymbolId>,
-    subsection_via_symbols: bool,
+    /// File flags that are specific to each file format.
+    pub flags: FileFlags,
     /// The symbol name mangling scheme.
     pub mangling: Mangling,
     /// Mach-O "_tlv_bootstrap" symbol.
@@ -46,7 +73,7 @@ impl Object {
             symbols: Vec::new(),
             symbol_map: HashMap::new(),
             stub_symbols: HashMap::new(),
-            subsection_via_symbols: false,
+            flags: FileFlags::None,
             mangling: Mangling::default(format, architecture),
             tlv_bootstrap: None,
         }
@@ -70,7 +97,7 @@ impl Object {
         self.mangling
     }
 
-    /// Return the current mangling setting.
+    /// Specify the mangling setting.
     #[inline]
     pub fn set_mangling(&mut self, mangling: Mangling) {
         self.mangling = mangling;
@@ -81,7 +108,11 @@ impl Object {
     /// This will vary based on the file format.
     pub fn segment_name(&self, segment: StandardSegment) -> &'static [u8] {
         match self.format {
-            BinaryFormat::Elf | BinaryFormat::Coff => &[],
+            #[cfg(feature = "coff")]
+            BinaryFormat::Coff => &[],
+            #[cfg(feature = "elf")]
+            BinaryFormat::Elf => &[],
+            #[cfg(feature = "macho")]
             BinaryFormat::Macho => self.macho_segment_name(segment),
             _ => unimplemented!(),
         }
@@ -133,9 +164,10 @@ impl Object {
             kind,
             size: 0,
             align: 1,
-            data: Vec::new(),
+            data: BytesMut::new(),
             relocations: Vec::new(),
             symbol: None,
+            flags: SectionFlags::None,
         });
 
         // Add to self.standard_sections if required. This may match multiple standard sections.
@@ -157,8 +189,11 @@ impl Object {
         section: StandardSection,
     ) -> (&'static [u8], &'static [u8], SectionKind) {
         match self.format {
-            BinaryFormat::Elf => self.elf_section_info(section),
+            #[cfg(feature = "coff")]
             BinaryFormat::Coff => self.coff_section_info(section),
+            #[cfg(feature = "elf")]
+            BinaryFormat::Elf => self.elf_section_info(section),
+            #[cfg(feature = "macho")]
             BinaryFormat::Macho => self.macho_section_info(section),
             _ => unimplemented!(),
         }
@@ -172,8 +207,8 @@ impl Object {
         data: &[u8],
         align: u64,
     ) -> (SectionId, u64) {
-        let section_id = if self.has_subsection_via_symbols() {
-            self.subsection_via_symbols = true;
+        let section_id = if self.has_subsections_via_symbols() {
+            self.set_subsections_via_symbols();
             self.section_id(section)
         } else {
             let (segment, name, kind) = self.subsection_info(section, name);
@@ -183,10 +218,18 @@ impl Object {
         (section_id, offset)
     }
 
-    fn has_subsection_via_symbols(&self) -> bool {
+    fn has_subsections_via_symbols(&self) -> bool {
         match self.format {
-            BinaryFormat::Elf | BinaryFormat::Coff => false,
+            BinaryFormat::Coff | BinaryFormat::Elf => false,
             BinaryFormat::Macho => true,
+            _ => unimplemented!(),
+        }
+    }
+
+    fn set_subsections_via_symbols(&mut self) {
+        match self.format {
+            #[cfg(feature = "macho")]
+            BinaryFormat::Macho => self.macho_set_subsections_via_symbols(),
             _ => unimplemented!(),
         }
     }
@@ -202,10 +245,12 @@ impl Object {
     }
 
     fn subsection_name(&self, section: &[u8], value: &[u8]) -> Vec<u8> {
-        debug_assert!(!self.has_subsection_via_symbols());
+        debug_assert!(!self.has_subsections_via_symbols());
         match self.format {
-            BinaryFormat::Elf => self.elf_subsection_name(section, value),
+            #[cfg(feature = "coff")]
             BinaryFormat::Coff => self.coff_subsection_name(section, value),
+            #[cfg(feature = "elf")]
+            BinaryFormat::Elf => self.elf_subsection_name(section, value),
             _ => unimplemented!(),
         }
     }
@@ -232,7 +277,13 @@ impl Object {
         // Defined symbols must have a scope.
         debug_assert!(symbol.is_undefined() || symbol.scope != SymbolScope::Unknown);
         if symbol.kind == SymbolKind::Section {
-            return self.section_symbol(symbol.section.unwrap());
+            // There can only be one section symbol, but update its flags, since
+            // the automatically generated section symbol will have none.
+            let symbol_id = self.section_symbol(symbol.section.id().unwrap());
+            if symbol.flags != SymbolFlags::None {
+                self.symbol_mut(symbol_id).flags = symbol.flags;
+            }
+            return symbol_id;
         }
         if !symbol.name.is_empty()
             && (symbol.kind == SymbolKind::Text
@@ -258,8 +309,31 @@ impl Object {
     }
 
     /// Return true if the file format supports `StandardSection::UninitializedTls`.
+    #[inline]
     pub fn has_uninitialized_tls(&self) -> bool {
         self.format != BinaryFormat::Coff
+    }
+
+    /// Return true if the file format supports `StandardSection::Common`.
+    #[inline]
+    pub fn has_common(&self) -> bool {
+        self.format == BinaryFormat::Macho
+    }
+
+    /// Add a new common symbol and return its `SymbolId`.
+    ///
+    /// For Mach-O, this appends the symbol to the `__common` section.
+    pub fn add_common_symbol(&mut self, mut symbol: Symbol, size: u64, align: u64) -> SymbolId {
+        if self.has_common() {
+            let symbol_id = self.add_symbol(symbol);
+            let section = self.section_id(StandardSection::Common);
+            self.add_symbol_bss(symbol_id, section, size, align);
+            symbol_id
+        } else {
+            symbol.section = SymbolSection::Common;
+            symbol.size = size;
+            self.add_symbol(symbol)
+        }
     }
 
     /// Add a new file symbol and return its `SymbolId`.
@@ -271,7 +345,8 @@ impl Object {
             kind: SymbolKind::File,
             scope: SymbolScope::Compilation,
             weak: false,
-            section: None,
+            section: SymbolSection::None,
+            flags: SymbolFlags::None,
         })
     }
 
@@ -294,7 +369,8 @@ impl Object {
             kind: SymbolKind::Section,
             scope: SymbolScope::Compilation,
             weak: false,
-            section: Some(section_id),
+            section: SymbolSection::Section(section_id),
+            flags: SymbolFlags::None,
         });
         section.symbol = Some(symbol_id);
         symbol_id
@@ -349,44 +425,42 @@ impl Object {
     ) {
         // Defined symbols must have a scope.
         debug_assert!(self.symbol(symbol_id).scope != SymbolScope::Unknown);
-        if self.format == BinaryFormat::Macho {
-            symbol_id = self.macho_add_thread_var(symbol_id);
+        match self.format {
+            #[cfg(feature = "macho")]
+            BinaryFormat::Macho => symbol_id = self.macho_add_thread_var(symbol_id),
+            _ => {}
         }
         let symbol = self.symbol_mut(symbol_id);
         symbol.value = offset;
         symbol.size = size;
-        symbol.section = Some(section);
+        symbol.section = SymbolSection::Section(section);
     }
 
     /// Convert a symbol to a section symbol and offset.
     ///
-    /// Returns an error if the symbol is not defined.
-    pub fn symbol_section_and_offset(
-        &mut self,
-        symbol_id: SymbolId,
-    ) -> Result<(SymbolId, u64), ()> {
+    /// Returns `None` if the symbol does not have a section.
+    pub fn symbol_section_and_offset(&mut self, symbol_id: SymbolId) -> Option<(SymbolId, u64)> {
         let symbol = self.symbol(symbol_id);
         if symbol.kind == SymbolKind::Section {
-            return Ok((symbol_id, 0));
+            return Some((symbol_id, 0));
         }
         let symbol_offset = symbol.value;
-        let section = symbol.section.ok_or(())?;
+        let section = symbol.section.id()?;
         let section_symbol = self.section_symbol(section);
-        Ok((section_symbol, symbol_offset))
+        Some((section_symbol, symbol_offset))
     }
 
     /// Add a relocation to a section.
     ///
     /// Relocations must only be added after the referenced symbols have been added
     /// and defined (if applicable).
-    pub fn add_relocation(
-        &mut self,
-        section: SectionId,
-        mut relocation: Relocation,
-    ) -> Result<(), String> {
+    pub fn add_relocation(&mut self, section: SectionId, mut relocation: Relocation) -> Result<()> {
         let addend = match self.format {
-            BinaryFormat::Elf => self.elf_fixup_relocation(&mut relocation)?,
+            #[cfg(feature = "coff")]
             BinaryFormat::Coff => self.coff_fixup_relocation(&mut relocation),
+            #[cfg(feature = "elf")]
+            BinaryFormat::Elf => self.elf_fixup_relocation(&mut relocation)?,
+            #[cfg(feature = "macho")]
             BinaryFormat::Macho => self.macho_fixup_relocation(&mut relocation),
             _ => unimplemented!(),
         };
@@ -402,40 +476,42 @@ impl Object {
         section: SectionId,
         relocation: &Relocation,
         addend: i64,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         let endian = match self.architecture.endianness().unwrap() {
-            Endianness::Little => scroll::LE,
-            Endianness::Big => scroll::BE,
+            Endianness::Little => RunTimeEndian::Little,
+            Endianness::Big => RunTimeEndian::Big,
         };
 
         let data = &mut self.sections[section.0].data;
-        if relocation.offset + (u64::from(relocation.size) + 7) / 8 > data.len() as u64 {
-            return Err(format!(
+        let offset = relocation.offset as usize;
+        match relocation.size {
+            32 => data.write_at(offset, &U32::new(endian, addend as u32)),
+            64 => data.write_at(offset, &U64::new(endian, addend as u64)),
+            _ => {
+                return Err(Error(format!(
+                    "unimplemented relocation addend {:?}",
+                    relocation
+                )));
+            }
+        }
+        .map_err(|_| {
+            Error(format!(
                 "invalid relocation offset {}+{} (max {})",
                 relocation.offset,
                 relocation.size,
                 data.len()
-            ));
-        }
-        match relocation.size {
-            32 => {
-                data.pwrite_with(addend as i32, relocation.offset as usize, endian)
-                    .unwrap();
-            }
-            64 => {
-                data.pwrite_with(addend, relocation.offset as usize, endian)
-                    .unwrap();
-            }
-            _ => return Err(format!("unimplemented relocation addend {:?}", relocation)),
-        }
-        Ok(())
+            ))
+        })
     }
 
     /// Write the object to a `Vec`.
-    pub fn write(&self) -> Result<Vec<u8>, String> {
+    pub fn write(&self) -> Result<Vec<u8>> {
         match self.format {
-            BinaryFormat::Elf => self.elf_write(),
+            #[cfg(feature = "coff")]
             BinaryFormat::Coff => self.coff_write(),
+            #[cfg(feature = "elf")]
+            BinaryFormat::Elf => self.elf_write(),
+            #[cfg(feature = "macho")]
             BinaryFormat::Macho => self.macho_write(),
             _ => unimplemented!(),
         }
@@ -466,6 +542,8 @@ pub enum StandardSection {
     UninitializedTls,
     /// TLS variable structures. Only supported for Mach-O.
     TlsVariables,
+    /// Common data. Only supported for Mach-O.
+    Common,
 }
 
 impl StandardSection {
@@ -482,9 +560,11 @@ impl StandardSection {
             StandardSection::Tls => SectionKind::Tls,
             StandardSection::UninitializedTls => SectionKind::UninitializedTls,
             StandardSection::TlsVariables => SectionKind::TlsVariables,
+            StandardSection::Common => SectionKind::Common,
         }
     }
 
+    // TODO: remembering to update this is error-prone, can we do better?
     fn all() -> &'static [StandardSection] {
         &[
             StandardSection::Text,
@@ -496,6 +576,7 @@ impl StandardSection {
             StandardSection::Tls,
             StandardSection::UninitializedTls,
             StandardSection::TlsVariables,
+            StandardSection::Common,
         ]
     }
 }
@@ -512,16 +593,24 @@ pub struct Section {
     kind: SectionKind,
     size: u64,
     align: u64,
-    data: Vec<u8>,
+    data: BytesMut,
     relocations: Vec<Relocation>,
     symbol: Option<SymbolId>,
+    /// Section flags that are specific to each file format.
+    pub flags: SectionFlags,
 }
 
 impl Section {
-    /// Return true if this section contains uninitialized data.
+    /// Try to convert the name to a utf8 string.
+    #[inline]
+    pub fn name(&self) -> Option<&str> {
+        str::from_utf8(&self.name).ok()
+    }
+
+    /// Return true if this section contains zerofill data.
     #[inline]
     pub fn is_bss(&self) -> bool {
-        self.kind == SectionKind::UninitializedData || self.kind == SectionKind::UninitializedTls
+        self.kind.is_bss()
     }
 
     /// Set the data for a section.
@@ -532,7 +621,7 @@ impl Section {
         debug_assert_eq!(align & (align - 1), 0);
         debug_assert!(self.data.is_empty());
         self.size = data.len() as u64;
-        self.data = data;
+        self.data = BytesMut(data);
         self.align = align;
     }
 
@@ -575,6 +664,35 @@ impl Section {
     }
 }
 
+/// The section where a symbol is defined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SymbolSection {
+    /// The section is not applicable for this symbol (such as file symbols).
+    None,
+    /// The symbol is undefined.
+    Undefined,
+    /// The symbol has an absolute value.
+    Absolute,
+    /// The symbol is a zero-initialized symbol that will be combined with duplicate definitions.
+    Common,
+    /// The symbol is defined in the given section.
+    Section(SectionId),
+}
+
+impl SymbolSection {
+    /// Returns the section id for the section where the symbol is defined.
+    ///
+    /// May return `None` if the symbol is not defined in a section.
+    #[inline]
+    pub fn id(self) -> Option<SectionId> {
+        if let SymbolSection::Section(id) = self {
+            Some(id)
+        } else {
+            None
+        }
+    }
+}
+
 /// An identifier used to reference a symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SymbolId(usize);
@@ -597,16 +715,30 @@ pub struct Symbol {
     /// Whether the symbol has weak binding.
     pub weak: bool,
     /// The section containing the symbol.
-    ///
-    /// Set to `None` for undefined symbols.
-    pub section: Option<SectionId>,
+    pub section: SymbolSection,
+    /// Symbol flags that are specific to each file format.
+    pub flags: SymbolFlags<SectionId>,
 }
 
 impl Symbol {
+    /// Try to convert the name to a utf8 string.
+    #[inline]
+    pub fn name(&self) -> Option<&str> {
+        str::from_utf8(&self.name).ok()
+    }
+
     /// Return true if the symbol is undefined.
     #[inline]
     pub fn is_undefined(&self) -> bool {
-        self.section.is_none()
+        self.section == SymbolSection::Undefined
+    }
+
+    /// Return true if the symbol is common data.
+    ///
+    /// Note: does not check for `SymbolSection::Section` with `SectionKind::Common`.
+    #[inline]
+    pub fn is_common(&self) -> bool {
+        self.section == SymbolSection::Common
     }
 
     /// Return true if the symbol scope is local.

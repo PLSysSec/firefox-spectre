@@ -19,7 +19,7 @@ pub enum SectionKind {
     ///
     /// Example ELF sections: `.rodata`
     ///
-    /// Example Mach-O sections: `__TEXT/__const`, `__DATA/__const`
+    /// Example Mach-O sections: `__TEXT/__const`, `__DATA/__const`, `__TEXT/__literal4`
     ReadOnlyData,
     /// A loadable string section.
     ///
@@ -33,6 +33,10 @@ pub enum SectionKind {
     ///
     /// Example Mach-O sections: `__DATA/__bss`
     UninitializedData,
+    /// An uninitialized common data section.
+    ///
+    /// Example Mach-O sections: `__DATA/__common`
+    Common,
     /// A TLS data section.
     ///
     /// Example ELF sections: `.tdata`
@@ -73,6 +77,15 @@ pub enum SectionKind {
     Metadata,
 }
 
+impl SectionKind {
+    /// Return true if this section contains zerofill data.
+    pub fn is_bss(self) -> bool {
+        self == SectionKind::UninitializedData
+            || self == SectionKind::UninitializedTls
+            || self == SectionKind::Common
+    }
+}
+
 /// The kind of a symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
@@ -90,8 +103,6 @@ pub enum SymbolKind {
     File,
     /// The symbol is for a code label.
     Label,
-    /// The symbol is for an uninitialized common block.
-    Common,
     /// The symbol is for a thread local storage entity.
     Tls,
 }
@@ -184,4 +195,74 @@ pub enum RelocationEncoding {
     ///
     /// The `RelocationKind` must be PC relative.
     X86Branch,
+}
+
+/// File flags that are specific to each file format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileFlags {
+    /// No file flags.
+    None,
+    /// ELF file flags.
+    Elf {
+        /// `e_flags` field in the ELF file header.
+        e_flags: u32,
+    },
+    /// Mach-O file flags.
+    MachO {
+        /// `flags` field in the Mach-O file header.
+        flags: u32,
+    },
+    /// COFF file flags.
+    Coff {
+        /// `Characteristics` field in the COFF file header.
+        characteristics: u16,
+    },
+}
+
+/// Section flags that are specific to each file format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionFlags {
+    /// No section flags.
+    None,
+    /// ELF section flags.
+    Elf {
+        /// `sh_flags` field in the section header.
+        sh_flags: u64,
+    },
+    /// Mach-O section flags.
+    MachO {
+        /// `flags` field in the section header.
+        flags: u32,
+    },
+    /// COFF section flags.
+    Coff {
+        /// `Characteristics` field in the section header.
+        characteristics: u32,
+    },
+}
+
+/// Symbol flags that are specific to each file format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolFlags<Section> {
+    /// No symbol flags.
+    None,
+    /// ELF symbol flags.
+    Elf {
+        /// `st_info` field in the ELF symbol.
+        st_info: u8,
+        /// `st_other` field in the ELF symbol.
+        st_other: u8,
+    },
+    /// Mach-O symbol flags.
+    MachO {
+        /// `n_desc` field in the Mach-O symbol.
+        n_desc: u16,
+    },
+    /// COFF flags for a section symbol.
+    CoffSection {
+        /// `Selection` field in the auxiliary symbol for the section.
+        selection: u8,
+        /// `Number` field in the auxiliary symbol for the section.
+        associative_section: Section,
+    },
 }

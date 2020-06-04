@@ -20,29 +20,28 @@
 
 /// Macro to create a local `base_ptr` raw pointer of the given type, avoiding UB as
 /// much as is possible currently.
-#[cfg(memoffset_maybe_uninit)]
+#[cfg(maybe_uninit)]
 #[macro_export]
 #[doc(hidden)]
 macro_rules! _memoffset__let_base_ptr {
-    ($name:ident, $type:tt) => {
+    ($name:ident, $type:path) => {
         // No UB here, and the pointer does not dangle, either.
         // But we have to make sure that `uninit` lives long enough,
         // so it has to be in the same scope as `$name`. That's why
         // `let_base_ptr` declares a variable (several, actually)
-        // instad of returning one.
+        // instead of returning one.
         let uninit = $crate::mem::MaybeUninit::<$type>::uninit();
         let $name = uninit.as_ptr();
     };
 }
-#[cfg(not(memoffset_maybe_uninit))]
+#[cfg(not(maybe_uninit))]
 #[macro_export]
 #[doc(hidden)]
 macro_rules! _memoffset__let_base_ptr {
-    ($name:ident, $type:tt) => {
-        // No UB right here, but we will later offset into a field
-        // of this pointer, and that is UB when the pointer is dangling.
-        let non_null = $crate::ptr::NonNull::<$type>::dangling();
-        let $name = non_null.as_ptr() as *const $type;
+    ($name:ident, $type:path) => {
+        // No UB right here, but we will later dereference this pointer to
+        // offset into a field, and that is UB when the pointer is dangling.
+        let $name = $crate::mem::align_of::<$type>() as *const $type;
     };
 }
 
@@ -50,12 +49,36 @@ macro_rules! _memoffset__let_base_ptr {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! _memoffset__field_check {
-    ($type:tt, $field:tt) => {
+    ($type:path, $field:tt) => {
         // Make sure the field actually exists. This line ensures that a
         // compile-time error is generated if $field is accessed through a
         // Deref impl.
+        #[cfg_attr(allow_clippy, allow(clippy::unneeded_field_pattern))]
         let $type { $field: _, .. };
     };
+}
+
+/// Computes a const raw pointer to the given field of the given base pointer
+/// to the given parent type.
+///
+/// The `base` pointer *must not* be dangling, but it *may* point to
+/// uninitialized memory.
+#[macro_export(local_inner_macros)]
+macro_rules! raw_field {
+    ($base:expr, $parent:path, $field:tt) => {{
+        _memoffset__field_check!($parent, $field);
+        let base_ptr: *const $parent = $base;
+
+        // Get the field address. This is UB because we are creating a reference to
+        // the uninitialized field. Will be updated to use `&raw` before rustc
+        // starts exploiting such UB.
+        // Crucially, we know that this will not trigger a deref coercion because
+        // of the `field_check!` we did above.
+        #[allow(unused_unsafe)] // for when the macro is used in an unsafe block
+        unsafe {
+            &(*base_ptr).$field as *const _
+        }
+    }};
 }
 
 /// Calculates the offset of the specified field from the start of the struct.
@@ -77,19 +100,37 @@ macro_rules! _memoffset__field_check {
 ///     assert_eq!(offset_of!(Foo, b), 4);
 /// }
 /// ```
+#[cfg(not(feature = "unstable_const"))]
 #[macro_export(local_inner_macros)]
 macro_rules! offset_of {
-    ($parent:tt, $field:tt) => {{
-        _memoffset__field_check!($parent, $field);
-
+    ($parent:path, $field:tt) => {{
         // Get a base pointer.
         _memoffset__let_base_ptr!(base_ptr, $parent);
-        // Get the field address. This is UB because we are creating a reference to
-        // the uninitialized field.
+        // Get field pointer.
+        let field_ptr = raw_field!(base_ptr, $parent, $field);
+        // Compute offset.
+        (field_ptr as usize) - (base_ptr as usize)
+    }};
+}
+
+#[cfg(feature = "unstable_const")]
+#[macro_export(local_inner_macros)]
+macro_rules! offset_of {
+    ($parent:path, $field:tt) => {{
+        // Get a base pointer.
+        // No UB here, and the pointer does not dangle, either.
+        let uninit = $crate::mem::MaybeUninit::<$parent>::uninit();
         #[allow(unused_unsafe)] // for when the macro is used in an unsafe block
-        let field_ptr = unsafe { &(*base_ptr).$field as *const _ };
-        let offset = (field_ptr as usize) - (base_ptr as usize);
-        offset
+        unsafe {
+            // This, on the other hand, *is* UB, since we're creating a reference
+            // to uninitialized data.
+            // Unfortunately it's the best we can do at the moment.
+            let base_ptr = $crate::mem::transmute::<_, &$parent>(&uninit) as *const $parent;
+            // Get a field pointer.
+            let field_ptr = raw_field!(base_ptr, $parent, $field);
+            // Compute offset.
+            (field_ptr as *const u8).offset_from(base_ptr as *const u8) as usize
+        }
     }};
 }
 
@@ -110,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(miri))] // this creates unaligned references
+    #[cfg_attr(miri, ignore)] // this creates unaligned references
     fn offset_simple_packed() {
         #[repr(C, packed)]
         struct Foo {
@@ -131,5 +172,61 @@ mod tests {
 
         assert_eq!(offset_of!(Tup, 0), 0);
         assert_eq!(offset_of!(Tup, 1), 4);
+    }
+
+    #[test]
+    fn path() {
+        mod sub {
+            #[repr(C)]
+            pub struct Foo {
+                pub x: u32,
+            }
+        }
+
+        assert_eq!(offset_of!(sub::Foo, x), 0);
+    }
+
+    #[test]
+    fn inside_generic_method() {
+        struct Pair<T, U>(T, U);
+
+        fn foo<T, U>(_: Pair<T, U>) -> usize {
+            offset_of!(Pair<T, U>, 1)
+        }
+
+        assert_eq!(foo(Pair(0, 0)), 4);
+    }
+
+    #[test]
+    fn test_raw_field() {
+        #[repr(C)]
+        struct Foo {
+            a: u32,
+            b: [u8; 2],
+            c: i64,
+        }
+
+        let f: Foo = Foo {
+            a: 0,
+            b: [0, 0],
+            c: 0,
+        };
+        let f_ptr = &f as *const _;
+        assert_eq!(f_ptr as usize + 0, raw_field!(f_ptr, Foo, a) as usize);
+        assert_eq!(f_ptr as usize + 4, raw_field!(f_ptr, Foo, b) as usize);
+        assert_eq!(f_ptr as usize + 8, raw_field!(f_ptr, Foo, c) as usize);
+    }
+
+    #[cfg(feature = "unstable_const")]
+    #[test]
+    fn const_offset() {
+        #[repr(C)]
+        struct Foo {
+            a: u32,
+            b: [u8; 2],
+            c: i64,
+        }
+
+        assert_eq!([0; offset_of!(Foo, b)].len(), 4);
     }
 }

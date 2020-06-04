@@ -6,8 +6,7 @@ use errno::Errno;
 use std::mem;
 use sys::signal::SigSet;
 
-#[derive(Clone, Copy)]
-#[allow(missing_debug_implementations)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct UContext {
     context: libc::ucontext_t,
 }
@@ -15,11 +14,11 @@ pub struct UContext {
 impl UContext {
     #[cfg(not(target_env = "musl"))]
     pub fn get() -> Result<UContext> {
-        let mut context: libc::ucontext_t = unsafe { mem::uninitialized() };
-        let res = unsafe {
-            libc::getcontext(&mut context as *mut libc::ucontext_t)
-        };
-        Errno::result(res).map(|_| UContext { context: context })
+        let mut context = mem::MaybeUninit::<libc::ucontext_t>::uninit();
+        let res = unsafe { libc::getcontext(context.as_mut_ptr()) };
+        Errno::result(res).map(|_| unsafe {
+            UContext { context: context.assume_init()}
+        })
     }
 
     #[cfg(not(target_env = "musl"))]

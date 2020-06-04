@@ -1,7 +1,10 @@
-use nix::fcntl::{openat, open, OFlag, readlink, readlinkat};
+use nix::Error;
+use nix::errno::*;
+use nix::fcntl::{openat, open, OFlag, readlink, readlinkat, renameat};
 use nix::sys::stat::Mode;
 use nix::unistd::{close, read};
 use tempfile::{self, NamedTempFile};
+use std::fs::File;
 use std::io::prelude::*;
 use std::os::unix::fs;
 
@@ -28,6 +31,22 @@ fn test_openat() {
 }
 
 #[test]
+fn test_renameat() {
+    let old_dir = tempfile::tempdir().unwrap();
+    let old_dirfd = open(old_dir.path(), OFlag::empty(), Mode::empty()).unwrap();
+    let old_path = old_dir.path().join("old");
+    File::create(&old_path).unwrap();
+    let new_dir = tempfile::tempdir().unwrap();
+    let new_dirfd = open(new_dir.path(), OFlag::empty(), Mode::empty()).unwrap();
+    renameat(Some(old_dirfd), "old", Some(new_dirfd), "new").unwrap();
+    assert_eq!(renameat(Some(old_dirfd), "old", Some(new_dirfd), "new").unwrap_err(),
+               Error::Sys(Errno::ENOENT));
+    close(old_dirfd).unwrap();
+    close(new_dirfd).unwrap();
+    assert!(new_dir.path().join("new").exists());
+}
+
+#[test]
 fn test_readlink() {
     let tempdir = tempfile::tempdir().unwrap();
     let src = tempdir.path().join("a");
@@ -37,26 +56,64 @@ fn test_readlink() {
     let dirfd = open(tempdir.path(),
                      OFlag::empty(),
                      Mode::empty()).unwrap();
+    let expected_dir = src.to_str().unwrap();
 
-    let mut buf = vec![0; src.to_str().unwrap().len() + 1];
-    assert_eq!(readlink(&dst, &mut buf).unwrap().to_str().unwrap(),
-               src.to_str().unwrap());
-    assert_eq!(readlinkat(dirfd, "b", &mut buf).unwrap().to_str().unwrap(),
-               src.to_str().unwrap());
+    assert_eq!(readlink(&dst).unwrap().to_str().unwrap(), expected_dir);
+    assert_eq!(readlinkat(dirfd, "b").unwrap().to_str().unwrap(), expected_dir);
+
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux_android {
     use std::io::prelude::*;
+    use std::io::SeekFrom;
     use std::os::unix::prelude::*;
 
     use libc::loff_t;
 
-    use nix::fcntl::{SpliceFFlags, FallocateFlags, fallocate, splice, tee, vmsplice};
+    use nix::fcntl::*;
     use nix::sys::uio::IoVec;
     use nix::unistd::{close, pipe, read, write};
 
     use tempfile::{tempfile, NamedTempFile};
+
+    /// This test creates a temporary file containing the contents
+    /// 'foobarbaz' and uses the `copy_file_range` call to transfer
+    /// 3 bytes at offset 3 (`bar`) to another empty file at offset 0. The
+    /// resulting file is read and should contain the contents `bar`.
+    /// The from_offset should be updated by the call to reflect
+    /// the 3 bytes read (6).
+    ///
+    /// FIXME: This test is disabled for linux based builds, because Travis
+    /// Linux version is too old for `copy_file_range`.
+    #[test]
+    #[ignore]
+    fn test_copy_file_range() {
+        const CONTENTS: &[u8] = b"foobarbaz";
+
+        let mut tmp1 = tempfile().unwrap();
+        let mut tmp2 = tempfile().unwrap();
+
+        tmp1.write_all(CONTENTS).unwrap();
+        tmp1.flush().unwrap();
+
+        let mut from_offset: i64 = 3;
+        copy_file_range(
+            tmp1.as_raw_fd(),
+            Some(&mut from_offset),
+            tmp2.as_raw_fd(),
+            None,
+            3,
+        )
+        .unwrap();
+
+        let mut res: String = String::new();
+        tmp2.seek(SeekFrom::Start(0)).unwrap();
+        tmp2.read_to_string(&mut res).unwrap();
+
+        assert_eq!(res, String::from("bar"));
+        assert_eq!(from_offset, 6);
+    }
 
     #[test]
     fn test_splice() {
@@ -139,5 +196,95 @@ mod linux_android {
         // Check if we read exactly 100 bytes
         let mut buf = [0u8; 200];
         assert_eq!(100, read(fd, &mut buf).unwrap());
+    }
+}
+
+#[cfg(any(target_os = "linux",
+          target_os = "android",
+          target_os = "emscripten",
+          target_os = "fuchsia",
+          any(target_os = "wasi", target_env = "wasi"),
+          target_env = "uclibc",
+          target_env = "freebsd"))]
+mod test_posix_fadvise {
+
+    use tempfile::NamedTempFile;
+    use std::os::unix::io::{RawFd, AsRawFd};
+    use nix::errno::Errno;
+    use nix::fcntl::*;
+    use nix::unistd::pipe;
+
+    #[test]
+    fn test_success() {
+        let tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.as_raw_fd();
+        let res = posix_fadvise(fd, 0, 100, PosixFadviseAdvice::POSIX_FADV_WILLNEED).unwrap();
+
+        assert_eq!(res, 0);
+    }
+
+    #[test]
+    fn test_errno() {
+        let (rd, _wr) = pipe().unwrap();
+        let errno = posix_fadvise(rd as RawFd, 0, 100, PosixFadviseAdvice::POSIX_FADV_WILLNEED)
+                                 .unwrap();
+        assert_eq!(errno, Errno::ESPIPE as i32);
+    }
+}
+
+#[cfg(any(target_os = "linux",
+          target_os = "android",
+          target_os = "emscripten",
+          target_os = "fuchsia",
+          any(target_os = "wasi", target_env = "wasi"),
+          target_os = "freebsd"))]
+mod test_posix_fallocate {
+
+    use tempfile::NamedTempFile;
+    use std::{io::Read, os::unix::io::{RawFd, AsRawFd}};
+    use nix::errno::Errno;
+    use nix::fcntl::*;
+    use nix::unistd::pipe;
+
+    #[test]
+    fn success() {
+        const LEN: usize = 100;
+        let mut tmp = NamedTempFile::new().unwrap();
+        let fd = tmp.as_raw_fd();
+        let res = posix_fallocate(fd, 0, LEN as libc::off_t);
+        match res {
+            Ok(_) => {
+                let mut data = [1u8; LEN];
+                assert_eq!(tmp.read(&mut data).expect("read failure"), LEN);
+                assert_eq!(&data[..], &[0u8; LEN][..]);
+            }
+            Err(nix::Error::Sys(Errno::EINVAL)) => {
+                // POSIX requires posix_fallocate to return EINVAL both for
+                // invalid arguments (i.e. len < 0) and if the operation is not
+                // supported by the file system.
+                // There's no way to tell for sure whether the file system
+                // supports posix_fallocate, so we must pass the test if it
+                // returns EINVAL.
+            }
+            _ => res.unwrap(),
+        }
+    }
+
+    #[test]
+    fn errno() {
+        let (rd, _wr) = pipe().unwrap();
+        let err = posix_fallocate(rd as RawFd, 0, 100).unwrap_err();
+        use nix::Error::Sys;
+        match err {
+            Sys(Errno::EINVAL)
+                | Sys(Errno::ENODEV)
+                | Sys(Errno::ESPIPE)
+                | Sys(Errno::EBADF) => (),
+            errno =>
+                panic!(
+                    "unexpected errno {}",
+                    errno,
+                ),
+        }
     }
 }

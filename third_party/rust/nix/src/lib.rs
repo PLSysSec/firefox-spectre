@@ -8,7 +8,7 @@
 // latest bitflags triggers a rustc bug with cross-crate macro expansions causing dead_code
 // warnings even though the macro expands into something with allow(dead_code)
 #![allow(dead_code)]
-// #![cfg_attr(test, deny(warnings))]
+#![cfg_attr(test, deny(warnings))]
 #![recursion_limit = "500"]
 #![deny(unused)]
 #![deny(unstable_features)]
@@ -35,7 +35,8 @@ pub mod errno;
 pub mod features;
 pub mod fcntl;
 #[deny(missing_docs)]
-#[cfg(any(target_os = "dragonfly",
+#[cfg(any(target_os = "android",
+          target_os = "dragonfly",
           target_os = "freebsd",
           target_os = "ios",
           target_os = "linux",
@@ -61,8 +62,6 @@ pub mod net;
 pub mod poll;
 #[deny(missing_docs)]
 pub mod pty;
-#[cfg(any(target_os = "android",
-          target_os = "linux"))]
 pub mod sched;
 pub mod sys;
 // This can be implemented for other platforms as soon as libc
@@ -97,7 +96,7 @@ pub type Result<T> = result::Result<T, Error>;
 /// error has a corresponding errno (usually the one from the
 /// underlying OS) to which it can be mapped in addition to
 /// implementing other common traits.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Sys(Errno),
     InvalidPath,
@@ -120,9 +119,9 @@ impl Error {
     /// let e = Error::from(Errno::EPERM);
     /// assert_eq!(Some(Errno::EPERM), e.as_errno());
     /// ```
-    pub fn as_errno(&self) -> Option<Errno> {
-        if let &Error::Sys(ref e) = self {
-            Some(*e)
+    pub fn as_errno(self) -> Option<Errno> {
+        if let Error::Sys(e) = self {
+            Some(e)
         } else {
             None
         }
@@ -153,16 +152,7 @@ impl From<std::string::FromUtf8Error> for Error {
     fn from(_: std::string::FromUtf8Error) -> Error { Error::InvalidUtf8 }
 }
 
-impl error::Error for Error {
-    fn description(&self) -> &str {
-        match *self {
-            Error::InvalidPath => "Invalid path",
-            Error::InvalidUtf8 => "Invalid UTF-8 string",
-            Error::UnsupportedOperation => "Unsupported Operation",
-            Error::Sys(ref errno) => errno.desc(),
-        }
-    }
-}
+impl error::Error for Error {}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -176,6 +166,8 @@ impl fmt::Display for Error {
 }
 
 pub trait NixPath {
+    fn is_empty(&self) -> bool;
+
     fn len(&self) -> usize;
 
     fn with_nix_path<T, F>(&self, f: F) -> Result<T>
@@ -183,6 +175,10 @@ pub trait NixPath {
 }
 
 impl NixPath for str {
+    fn is_empty(&self) -> bool {
+        NixPath::is_empty(OsStr::new(self))
+    }
+
     fn len(&self) -> usize {
         NixPath::len(OsStr::new(self))
     }
@@ -194,6 +190,10 @@ impl NixPath for str {
 }
 
 impl NixPath for OsStr {
+    fn is_empty(&self) -> bool {
+        self.as_bytes().is_empty()
+    }
+
     fn len(&self) -> usize {
         self.as_bytes().len()
     }
@@ -205,6 +205,10 @@ impl NixPath for OsStr {
 }
 
 impl NixPath for CStr {
+    fn is_empty(&self) -> bool {
+        self.to_bytes().is_empty()
+    }
+
     fn len(&self) -> usize {
         self.to_bytes().len()
     }
@@ -221,6 +225,10 @@ impl NixPath for CStr {
 }
 
 impl NixPath for [u8] {
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+
     fn len(&self) -> usize {
         self.len()
     }
@@ -248,6 +256,10 @@ impl NixPath for [u8] {
 }
 
 impl NixPath for Path {
+    fn is_empty(&self) -> bool {
+        NixPath::is_empty(self.as_os_str())
+    }
+
     fn len(&self) -> usize {
         NixPath::len(self.as_os_str())
     }
@@ -258,6 +270,10 @@ impl NixPath for Path {
 }
 
 impl NixPath for PathBuf {
+    fn is_empty(&self) -> bool {
+        NixPath::is_empty(self.as_os_str())
+    }
+
     fn len(&self) -> usize {
         NixPath::len(self.as_os_str())
     }
@@ -269,6 +285,10 @@ impl NixPath for PathBuf {
 
 /// Treats `None` as an empty string.
 impl<'a, NP: ?Sized + NixPath>  NixPath for Option<&'a NP> {
+    fn is_empty(&self) -> bool {
+        self.map_or(true, NixPath::is_empty)
+    }
+
     fn len(&self) -> usize {
         self.map_or(0, NixPath::len)
     }

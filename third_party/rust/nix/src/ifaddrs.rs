@@ -15,7 +15,7 @@ use sys::socket::SockAddr;
 use net::if_::*;
 
 /// Describes a single address for an interface as returned by `getifaddrs`.
-#[derive(Clone, Eq, Hash, PartialEq, Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct InterfaceAddress {
     /// Name of the network interface
     pub interface_name: String,
@@ -32,7 +32,7 @@ pub struct InterfaceAddress {
 }
 
 cfg_if! {
-    if #[cfg(any(target_os = "emscripten", target_os = "fuchsia", target_os = "linux"))] {
+    if #[cfg(any(target_os = "android", target_os = "emscripten", target_os = "fuchsia", target_os = "linux"))] {
         fn get_ifu_from_sockaddr(info: &libc::ifaddrs) -> *const libc::sockaddr {
             info.ifa_ifu
         }
@@ -52,8 +52,8 @@ impl InterfaceAddress {
         let mut addr = InterfaceAddress {
             interface_name: ifname.to_string_lossy().to_string(),
             flags: InterfaceFlags::from_bits_truncate(info.ifa_flags as i32),
-            address: address,
-            netmask: netmask,
+            address,
+            netmask,
             broadcast: None,
             destination: None,
         };
@@ -125,13 +125,15 @@ impl Iterator for InterfaceAddressIterator {
 /// }
 /// ```
 pub fn getifaddrs() -> Result<InterfaceAddressIterator> {
-    let mut addrs: *mut libc::ifaddrs = unsafe { mem::uninitialized() };
-    Errno::result(unsafe { libc::getifaddrs(&mut addrs) }).map(|_| {
-        InterfaceAddressIterator {
-            base: addrs,
-            next: addrs,
-        }
-    })
+    let mut addrs = mem::MaybeUninit::<*mut libc::ifaddrs>::uninit();
+    unsafe {
+        Errno::result(libc::getifaddrs(addrs.as_mut_ptr())).map(|_| {
+            InterfaceAddressIterator {
+                base: addrs.assume_init(),
+                next: addrs.assume_init(),
+            }
+        })
+    }
 }
 
 #[cfg(test)]
