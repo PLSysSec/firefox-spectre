@@ -1005,7 +1005,7 @@ class TreeMetadataEmitter(LoggingMixin):
                 if cls is WasmSources:
                     srcs.append(
                         mozpath.join(self.config.topsrcdir,
-                                     ('third_party/rust/rlbox_lucet_sandbox/'
+                                     ('../rlbox_lucet_spectre_sandbox/'
                                       'c_src/lucet_sandbox_wrapper.c')))
                 sorted_files = sorted(srcs, key=canonical_suffix_for_file)
                 for canonical_suffix, files in itertools.groupby(

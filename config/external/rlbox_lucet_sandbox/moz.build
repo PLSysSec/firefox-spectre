@@ -5,8 +5,8 @@
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 EXPORTS.mozilla.rlbox += [
-    '/third_party/rust/rlbox_lucet_sandbox/include/lucet_sandbox.h',
-    '/third_party/rust/rlbox_lucet_sandbox/include/rlbox_lucet_sandbox.hpp',
+    '/../rlbox_lucet_spectre_sandbox/include/lucet_sandbox.h',
+    '/../rlbox_lucet_spectre_sandbox/include/rlbox_lucet_sandbox.hpp',
 ]
 
 SOURCES += [

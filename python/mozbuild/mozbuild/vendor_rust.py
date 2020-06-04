@@ -198,6 +198,7 @@ Please commit or stash these changes before vendoring, or re-run with `--ignore-
             'qlog',
         ],
         'BSD-3-Clause': [
+            'subtle'
         ]
     }
 

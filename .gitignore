@@ -26,7 +26,7 @@ ID
 
 # User files that may appear at the root
 /.mozconfig*
-/mozconfig*
+
 /configure
 /old-configure
 /config.cache
@@ -163,3 +163,4 @@ lextab.py
 !.vscode/extensions.json
 !.vscode/tasks.json
 
+builds/bootstrap
